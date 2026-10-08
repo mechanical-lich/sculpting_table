@@ -1,0 +1,55 @@
+:root {
+  --chrome: #2b2d31;
+  --button: #36383d;
+  --button-hover: #414349;
+  --line: #44474d;
+  --text: #dcdde0;
+  --muted: #9a9ca3;
+  --accent: #e0b84a;
+  --accent-bg: #4a4232;
+  color-scheme: dark;
+  font:
+    12px/1.4 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  color: var(--text);
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #1e1f22;
+  user-select: none;
+  -webkit-user-select: none;
+  overscroll-behavior: none;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+}
+
+.viewport {
+  position: absolute;
+  top: 36px;
+  left: 0;
+  right: 240px;
+  bottom: 0;
+  width: calc(100% - 240px);
+  height: calc(100% - 36px);
+  display: block;
+  cursor: crosshair;
+  outline: none;
+}
+
+.fatal {
+  max-width: 520px;
+  margin: 15vh auto;
+  padding: 0 16px;
+}
+.fatal h1 {
+  font-size: 18px;
+}
