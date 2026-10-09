@@ -8,6 +8,9 @@ const crossOriginIsolation = {
 
 export default defineConfig({
   plugins: [svelte()],
+  // Relative asset paths, so the build works under any subpath
+  // (GitHub Pages project sites serve from /<repo-name>/).
+  base: './',
   // Cross-origin isolation, so SharedArrayBuffer is available (docs/multires.md).
   server: { headers: crossOriginIsolation },
   preview: { headers: crossOriginIsolation },
