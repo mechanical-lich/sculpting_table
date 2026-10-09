@@ -1,13 +1,15 @@
 import type { Mesh } from '../core/mesh';
+import type { Stamp } from '../core/stamp';
 import backgroundWgsl from './background.wgsl?raw';
 import { DirtyChunks } from './dirtyChunks';
 import meshWgsl from './mesh.wgsl?raw';
 import type { FrameParams, Renderer } from './renderer';
+import stencilWgsl from './stencil.wgsl?raw';
 
 const SAMPLE_COUNT = 4;
 const DEPTH_FORMAT: GPUTextureFormat = 'depth24plus';
-// mat4 + 7 vec4.
-const UNIFORM_FLOATS = 16 + 7 * 4;
+// mat4 + 8 vec4.
+const UNIFORM_FLOATS = 16 + 8 * 4;
 
 const BASE_COLOR = [0.66, 0.6, 0.55];
 const RING_COLOR = [0.95, 0.85, 0.3];
@@ -32,6 +34,7 @@ interface GpuMesh {
   mesh: Mesh;
   positions: GPUBuffer;
   normals: GPUBuffer;
+  mask: GPUBuffer;
   indices: GPUBuffer;
   indexCount: number;
   dirty: DirtyChunks;
@@ -44,6 +47,12 @@ export class WebGPURenderer implements Renderer {
   private readonly uniformBuffer: GPUBuffer;
   private readonly uniformData = new Float32Array(UNIFORM_FLOATS);
   private readonly bindGroup: GPUBindGroup;
+  private readonly stencilPipeline: GPURenderPipeline;
+  private readonly stencilUniforms: GPUBuffer;
+  private readonly stencilUniformData = new Float32Array(8);
+  private readonly stencilSampler: GPUSampler;
+  private stencilTexture: GPUTexture | null = null;
+  private stencilBindGroup: GPUBindGroup | null = null;
   private msaaTexture: GPUTexture | null = null;
   private depthTexture: GPUTexture | null = null;
   private gpuMesh: GpuMesh | null = null;
@@ -57,7 +66,8 @@ export class WebGPURenderer implements Renderer {
 
     const meshModule = device.createShaderModule({ label: 'mesh', code: meshWgsl });
     const bgModule = device.createShaderModule({ label: 'background', code: backgroundWgsl });
-    for (const m of [meshModule, bgModule]) void reportShaderErrors(m);
+    const stencilModule = device.createShaderModule({ label: 'stencil', code: stencilWgsl });
+    for (const m of [meshModule, bgModule, stencilModule]) void reportShaderErrors(m);
     const multisample = { count: SAMPLE_COUNT };
 
     this.meshPipeline = device.createRenderPipeline({
@@ -69,6 +79,7 @@ export class WebGPURenderer implements Renderer {
         buffers: [
           { arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] },
           { arrayStride: 12, attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x3' }] },
+          { arrayStride: 4, attributes: [{ shaderLocation: 2, offset: 0, format: 'float32' }] },
         ],
       },
       fragment: { module: meshModule, entryPoint: 'fs', targets: [{ format: this.format }] },
@@ -87,6 +98,39 @@ export class WebGPURenderer implements Renderer {
       multisample,
     });
 
+    this.stencilPipeline = device.createRenderPipeline({
+      label: 'stencil',
+      layout: 'auto',
+      vertex: { module: stencilModule, entryPoint: 'vs' },
+      fragment: {
+        module: stencilModule,
+        entryPoint: 'fs',
+        targets: [
+          {
+            format: this.format,
+            blend: {
+              color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+              alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+            },
+          },
+        ],
+      },
+      primitive: { topology: 'triangle-list' },
+      depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: false, depthCompare: 'always' },
+      multisample,
+    });
+    this.stencilUniforms = device.createBuffer({
+      label: 'stencil uniforms',
+      size: this.stencilUniformData.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.stencilSampler = device.createSampler({
+      addressModeU: 'repeat',
+      addressModeV: 'repeat',
+      magFilter: 'linear',
+      minFilter: 'linear',
+    });
+
     this.uniformBuffer = device.createBuffer({
       label: 'uniforms',
       size: UNIFORM_FLOATS * 4,
@@ -95,6 +139,34 @@ export class WebGPURenderer implements Renderer {
     this.bindGroup = device.createBindGroup({
       layout: this.meshPipeline.getBindGroupLayout(0),
       entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
+    });
+  }
+
+  setStencilImage(image: Stamp | null): void {
+    this.stencilTexture?.destroy();
+    this.stencilTexture = null;
+    this.stencilBindGroup = null;
+    if (!image) return;
+    const texture = this.device.createTexture({
+      label: 'stencil',
+      size: [image.width, image.height],
+      format: 'r8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    const bytes = new Uint8Array(image.width * image.height);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.round(image.data[i] * 255);
+    this.device.queue.writeTexture({ texture }, bytes, { bytesPerRow: image.width }, [
+      image.width,
+      image.height,
+    ]);
+    this.stencilTexture = texture;
+    this.stencilBindGroup = this.device.createBindGroup({
+      layout: this.stencilPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.stencilUniforms } },
+        { binding: 1, resource: texture.createView() },
+        { binding: 2, resource: this.stencilSampler },
+      ],
     });
   }
 
@@ -114,6 +186,7 @@ export class WebGPURenderer implements Renderer {
       mesh,
       positions: make('positions', mesh.positions, GPUBufferUsage.VERTEX),
       normals: make('normals', mesh.normals, GPUBufferUsage.VERTEX),
+      mask: make('mask', mesh.mask, GPUBufferUsage.VERTEX),
       indices: make('indices', mesh.indices, GPUBufferUsage.INDEX),
       indexCount: mesh.indices.length,
       dirty: new DirtyChunks(mesh.vertexCount),
@@ -180,8 +253,24 @@ export class WebGPURenderer implements Renderer {
       pass.setBindGroup(0, this.bindGroup);
       pass.setVertexBuffer(0, gm.positions);
       pass.setVertexBuffer(1, gm.normals);
+      pass.setVertexBuffer(2, gm.mask);
       pass.setIndexBuffer(gm.indices, 'uint32');
       pass.drawIndexed(gm.indexCount);
+    }
+
+    const st = frame.stencil;
+    if (st && this.stencilBindGroup) {
+      const u = this.stencilUniformData;
+      u[0] = st.centerX;
+      u[1] = st.centerY;
+      u[2] = st.halfSize;
+      u[3] = st.angle;
+      u[4] = st.opacity;
+      u[5] = st.tile ? 1 : 0;
+      this.device.queue.writeBuffer(this.stencilUniforms, 0, u);
+      pass.setPipeline(this.stencilPipeline);
+      pass.setBindGroup(0, this.stencilBindGroup);
+      pass.draw(3);
     }
     pass.end();
     this.device.queue.submit([encoder.finish()]);
@@ -192,12 +281,14 @@ export class WebGPURenderer implements Renderer {
     this.msaaTexture?.destroy();
     this.depthTexture?.destroy();
     this.uniformBuffer.destroy();
+    this.stencilUniforms.destroy();
+    this.stencilTexture?.destroy();
     this.device.destroy();
   }
 
-  /** Uploads only the touched chunks of the position and normal buffers. */
+  /** Uploads only the touched chunks of the position, normal and mask buffers. */
   private flushDirty(gm: GpuMesh): void {
-    const { mesh, positions, normals } = gm;
+    const { mesh, positions, normals, mask } = gm;
     const q = this.device.queue;
     gm.dirty.flush(mesh.vertexCount, (first, count) => {
       const byteOffset = first * 12;
@@ -216,6 +307,7 @@ export class WebGPURenderer implements Renderer {
         mesh.normals.byteOffset + byteOffset,
         byteLength,
       );
+      q.writeBuffer(mask, first * 4, mesh.mask.buffer, mesh.mask.byteOffset + first * 4, count * 4);
     });
   }
 
@@ -235,6 +327,7 @@ export class WebGPURenderer implements Renderer {
       u.fill(0, 28, 40);
     }
     u.set([BASE_COLOR[0], BASE_COLOR[1], BASE_COLOR[2], 1], 40);
+    u.set([frame.symmetryX ? 1 : 0, 0, 0, 0], 44);
     this.device.queue.writeBuffer(this.uniformBuffer, 0, u);
   }
 
@@ -242,6 +335,7 @@ export class WebGPURenderer implements Renderer {
     if (!this.gpuMesh) return;
     this.gpuMesh.positions.destroy();
     this.gpuMesh.normals.destroy();
+    this.gpuMesh.mask.destroy();
     this.gpuMesh.indices.destroy();
     this.gpuMesh = null;
   }

@@ -10,6 +10,8 @@ struct Uniforms {
   // rgb = ring color, a = 1 while a stroke is active.
   brushColor: vec4f,
   baseColor: vec4f,
+  // x = 1 draws the X-symmetry line (where the surface crosses x = 0).
+  options: vec4f,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -18,14 +20,16 @@ struct VSOut {
   @builtin(position) position: vec4f,
   @location(0) world: vec3f,
   @location(1) normal: vec3f,
+  @location(2) mask: f32,
 };
 
 @vertex
-fn vs(@location(0) position: vec3f, @location(1) normal: vec3f) -> VSOut {
+fn vs(@location(0) position: vec3f, @location(1) normal: vec3f, @location(2) mask: f32) -> VSOut {
   var out: VSOut;
   out.position = u.viewProj * vec4f(position, 1.0);
   out.world = position;
   out.normal = normal;
+  out.mask = mask;
   return out;
 }
 
@@ -57,6 +61,16 @@ fn fs(in: VSOut) -> @location(0) vec4f {
   let rim = pow(1.0 - max(dot(n, v), 0.0), 4.0) * 0.08;
 
   var color = u.baseColor.rgb * (diffKey * 0.95 + diffFill + hemi) + vec3f(spec + rim);
+
+  // Masked (frozen) areas: a cool tint that keeps the shading readable.
+  let masked = color * vec3f(0.55, 0.68, 1.1) + vec3f(0.0, 0.015, 0.05);
+  color = mix(color, masked, clamp(in.mask, 0.0, 1.0) * 0.85);
+
+  // Symmetry line: a 1-2 pixel band where the surface crosses x = 0. The
+  // derivative is taken unconditionally to keep control flow uniform.
+  let fx = max(fwidth(in.world.x), 1e-6);
+  let line = (1.0 - smoothstep(0.5 * fx, 1.5 * fx, abs(in.world.x))) * u.options.x;
+  color = mix(color, vec3f(0.35, 0.85, 0.95), line * 0.85);
 
   let ring = max(brushRing(in.world, u.brush), brushRing(in.world, u.brushMirror));
   color = mix(color, u.brushColor.rgb, ring);

@@ -1,6 +1,12 @@
 import type { Mesh } from '../core/mesh';
 import type { Multires } from '../core/multires';
-import { applyEntry, UndoStack, type ArrayPatch, type UndoEntry } from '../core/undo';
+import {
+  applyEntry,
+  UndoStack,
+  wholeArrayPatch,
+  type ArrayPatch,
+  type UndoEntry,
+} from '../core/undo';
 import { Emitter } from '../tools/emitter';
 
 /** Largest model `addLevel` will create (the plan's budget). */
@@ -28,7 +34,11 @@ export interface DocumentView {
   setMesh(mesh: Mesh): void;
   /** Vertices of the active mesh changed outside a stroke (undo, redo). */
   meshEdited(vertices: Uint32Array): void;
+  /** Mask values of the active mesh changed outside a stroke. */
+  maskEdited(vertices: Uint32Array): void;
 }
+
+export type MaskCommand = 'invert' | 'clear' | 'all';
 
 /**
  * The sculpt being edited: a multires model, the active level, and undo
@@ -40,12 +50,19 @@ export class SculptDocument {
   private view: DocumentView | null = null;
   private active: number;
   private activeMesh: Mesh;
+  /**
+   * The level whose mask is authoritative: where it was last edited. Other
+   * levels get their mask carried from here on a switch, so visiting a lower
+   * level and coming back doesn't blur a mask painted at a higher one.
+   */
+  private maskLevel: number;
 
   constructor(
     readonly multires: Multires,
     level = multires.top,
   ) {
     this.active = level;
+    this.maskLevel = level;
     multires.ensureCurrent(level);
     this.activeMesh = multires.createLevelMesh(level);
   }
@@ -80,6 +97,8 @@ export class SculptDocument {
     k = Math.max(0, Math.min(this.multires.top, k));
     if (k === this.active) return;
     this.multires.ensureCurrent(k);
+    // The mask follows you between levels.
+    this.multires.transferMask(this.maskLevel, k);
     this.active = k;
     this.activeMesh = this.multires.createLevelMesh(k);
     this.view?.setMesh(this.activeMesh);
@@ -98,8 +117,29 @@ export class SculptDocument {
     return true;
   }
 
-  commitStroke(stroke: ArrayPatch): void {
-    this.history.push(this.multires.commit(this.active, stroke));
+  /** A finished stroke on the active level: a sculpt (positions) or a mask stroke. */
+  commitStroke(stroke: ArrayPatch, kind: 'sculpt' | 'mask' = 'sculpt'): void {
+    if (kind === 'mask') {
+      this.history.push({ level: this.active, mask: true, patches: [stroke] });
+      this.maskLevel = this.active;
+    } else {
+      this.history.push(this.multires.commit(this.active, stroke));
+    }
+    this.emitHistory();
+    this.events.emit('edited', undefined);
+  }
+
+  /** Whole-mask edits on the active level, undoable. */
+  maskCommand(cmd: MaskCommand): void {
+    const mask = this.activeMesh.mask;
+    const before = mask.slice();
+    if (cmd === 'clear') mask.fill(0);
+    else if (cmd === 'all') mask.fill(1);
+    else for (let i = 0; i < mask.length; i++) mask[i] = 1 - mask[i];
+    const patch = wholeArrayPatch(mask, 1, before);
+    this.history.push({ level: this.active, mask: true, patches: [patch] });
+    this.maskLevel = this.active;
+    this.view?.maskEdited(patch.indices);
     this.emitHistory();
     this.events.emit('edited', undefined);
   }
@@ -118,9 +158,14 @@ export class SculptDocument {
     this.setLevel(next.level);
     pop();
     applyEntry(next, side);
-    this.multires.invalidateAbove(next.level);
-    // The first patch is always the stroke on the level's own positions.
-    this.view?.meshEdited(next.patches[0].indices);
+    if (next.mask) {
+      this.maskLevel = next.level;
+      this.view?.maskEdited(next.patches[0].indices);
+    } else {
+      this.multires.invalidateAbove(next.level);
+      // The first patch is always the stroke on the level's own positions.
+      this.view?.meshEdited(next.patches[0].indices);
+    }
     this.emitHistory();
     this.events.emit('edited', undefined);
     return true;

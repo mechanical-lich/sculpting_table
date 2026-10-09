@@ -1,5 +1,8 @@
 import { BRUSH_ORDER, BRUSHES, BrushEngine, type BrushKind } from '../core/brush';
+import type { DabStamp } from '../core/brush';
 import type { FalloffKind } from '../core/falloff';
+import type { Stamp } from '../core/stamp';
+import type { DabStencil } from '../core/stencil';
 import type { Mesh } from '../core/mesh';
 import { NormalUpdater } from '../core/normals';
 import { RaycastScratch, raycastMesh, type RayHit } from '../core/raycast';
@@ -8,6 +11,7 @@ import { StrokeRecorder, type ArrayPatch } from '../core/undo';
 import type { BrushOverlay } from '../gpu/renderer';
 import type { Camera } from './camera';
 import { Emitter } from './emitter';
+import { StampLibrary, type StampEntry, type StampRotation, type StampSettings } from './stamps';
 import { StrokeSampler, type StrokeSample } from './stroke';
 
 export interface ToolSettings {
@@ -18,11 +22,32 @@ export interface ToolSettings {
   strength: Record<BrushKind, number>;
   /** Per-brush falloff curve. */
   falloff: Record<BrushKind, FalloffKind>;
+  /** Per-brush stamp. */
+  stamp: Record<BrushKind, StampSettings>;
+  /** One stencil for all brushes, as in Mudbox. */
+  stencil: StencilSettings;
   symmetryX: boolean;
 }
 
 export interface ToolEvents extends Record<string, unknown> {
   settings: ToolSettings;
+  /** The stamp library changed (an image was loaded). */
+  stamps: readonly StampEntry[];
+}
+
+/** A screen-space stencil. Positions and sizes are CSS pixels in the viewport. */
+export interface StencilSettings {
+  /** Image from the stamp library, or null for no stencil. */
+  id: string | null;
+  centerX: number;
+  centerY: number;
+  /** Side length of the stencil square. */
+  size: number;
+  /** Clockwise, radians. */
+  angle: number;
+  /** Overlay opacity (display only). */
+  opacity: number;
+  tile: boolean;
 }
 
 export interface StrokeModifiers {
@@ -36,6 +61,8 @@ export const RADIUS_MIN_PX = 2;
 export const RADIUS_MAX_PX = 600;
 /** Dab spacing as a fraction of the brush radius. */
 const SPACING = 0.15;
+/** Default dab spacing with a stamp: wider, so the texture doesn't smear. */
+const STAMP_SPACING = 0.5;
 /** Time budget for applying dabs in one frame; the rest carries to the next frame. */
 const FRAME_BUDGET_MS = 10;
 /** Smooth at strength 1 moves this fraction of the way to the neighbor average per dab. */
@@ -46,8 +73,11 @@ export interface MeshSink {
   markDirty(vertices: Uint32Array): void;
 }
 
-/** Receives each finished stroke (a patch on the mesh positions), e.g. for multires and undo. */
-export type StrokeCommit = (stroke: ArrayPatch) => void;
+/**
+ * Receives each finished stroke, e.g. for multires and undo: a patch on the
+ * mesh positions, or on its mask for Mask strokes.
+ */
+export type StrokeCommit = (stroke: ArrayPatch, kind: 'sculpt' | 'mask') => void;
 
 /**
  * Sculpt tool state machine: hover and stroke (begin -> samples -> end) on
@@ -61,6 +91,8 @@ export class SculptTool {
     radiusPx: 60,
     strength: perBrush((b) => BRUSHES[b].defaultStrength),
     falloff: perBrush((b) => BRUSHES[b].defaultFalloff),
+    stamp: perBrush(() => ({ id: null, rotation: 'stroke', spacing: STAMP_SPACING })),
+    stencil: { id: null, centerX: 0, centerY: 0, size: 300, angle: 0, opacity: 0.35, tile: true },
     symmetryX: false,
   };
 
@@ -74,9 +106,14 @@ export class SculptTool {
   private stroking = false;
   private strokeBrush: BrushKind = 'sculpt';
   private strokeSign = 1;
+  private smoothMask = false;
   /** World radius, fixed at the first hit of a stroke so zoom can't change it mid-stroke. */
   private strokeRadius = 0;
   private dabCursor = 0;
+  /** Screen position of the previous dab, for stamps that follow the stroke. */
+  private prevDabX = NaN;
+  private prevDabY = NaN;
+  private rngState = 1;
   /** Running average cost of one dab, to avoid starting one that would blow the frame budget. */
   private dabCostMs = 1;
 
@@ -157,6 +194,72 @@ export class SculptTool {
     this.emitSettings();
   }
 
+  readonly stamps = new StampLibrary();
+
+  setStamp(brush: BrushKind, id: string | null): void {
+    this.settings.stamp[brush].id = this.stamps.get(id) ? id : null;
+    this.emitSettings();
+  }
+
+  setStampRotation(brush: BrushKind, rotation: StampRotation): void {
+    this.settings.stamp[brush].rotation = rotation;
+    this.emitSettings();
+  }
+
+  setStampSpacing(brush: BrushKind, spacing: number): void {
+    this.settings.stamp[brush].spacing = Math.min(2, Math.max(0.05, spacing));
+    this.emitSettings();
+  }
+
+  /**
+   * Adds an image to the library (shared by stamps and the stencil). By
+   * default it also becomes the current brush's stamp.
+   */
+  addStamp(label: string, stamp: Stamp, selectAsStamp = true): StampEntry {
+    const entry = this.stamps.add(label, stamp);
+    this.events.emit('stamps', this.stamps.entries);
+    if (selectAsStamp) this.setStamp(this.settings.brush, entry.id);
+    return entry;
+  }
+
+  /** Picks the stencil image. Turning a stencil on centers it in the viewport. */
+  setStencil(id: string | null): void {
+    const st = this.settings.stencil;
+    const next = this.stamps.get(id) ? id : null;
+    if (st.id === null && next !== null) this.resetStencilPlacement();
+    st.id = next;
+    this.emitSettings();
+  }
+
+  /** Centers the stencil and sizes it to the viewport, unrotated. */
+  resetStencilPlacement(): void {
+    const st = this.settings.stencil;
+    st.centerX = this.camera.widthPx / 2;
+    st.centerY = this.camera.heightPx / 2;
+    st.size = Math.min(this.camera.widthPx, this.camera.heightPx) * 0.7;
+    st.angle = 0;
+    this.emitSettings();
+  }
+
+  setStencilPlacement(centerX: number, centerY: number, size: number, angle: number): void {
+    const st = this.settings.stencil;
+    st.centerX = centerX;
+    st.centerY = centerY;
+    st.size = Math.min(8000, Math.max(16, size));
+    st.angle = angle;
+    this.emitSettings();
+  }
+
+  setStencilOpacity(opacity: number): void {
+    this.settings.stencil.opacity = Math.min(1, Math.max(0, opacity));
+    this.emitSettings();
+  }
+
+  setStencilTile(tile: boolean): void {
+    this.settings.stencil.tile = tile;
+    this.emitSettings();
+  }
+
   setSymmetryX(on: boolean): void {
     this.settings.symmetryX = on;
     this.emitSettings();
@@ -172,6 +275,8 @@ export class SculptTool {
       ...this.settings,
       strength: { ...this.settings.strength },
       falloff: { ...this.settings.falloff },
+      stamp: perBrush((b) => ({ ...this.settings.stamp[b] })),
+      stencil: { ...this.settings.stencil },
     });
   }
 
@@ -192,11 +297,17 @@ export class SculptTool {
   beginStroke(s: StrokeSample, mods: StrokeModifiers): void {
     this.stroking = true;
     this.modifiers = mods;
-    this.strokeBrush = mods.smooth ? 'smooth' : this.settings.brush;
+    // Shift smooths, except with the Mask brush, where it smooths the mask.
+    const brush = this.settings.brush;
+    this.strokeBrush = mods.smooth && brush !== 'mask' ? 'smooth' : brush;
+    this.smoothMask = mods.smooth && brush === 'mask';
     this.strokeSign = mods.invert ? -1 : 1;
     this.strokeRadius = 0;
     this.dabCursor = 0;
-    this.recorder.begin();
+    if (this.strokeBrush === 'mask') this.recorder.begin(this.mesh.mask, 1);
+    else this.recorder.begin(this.mesh.positions);
+    this.prevDabX = this.prevDabY = NaN;
+    this.rngState = (Math.floor(s.time) | 1) >>> 0;
     if (this.strokeBrush === 'grab') this.beginGrab(s);
     else this.sampler.begin(s);
   }
@@ -208,8 +319,14 @@ export class SculptTool {
       this.grabY = s.y;
       this.grabPending = this.grabbing;
     } else {
-      this.sampler.add(s, this.settings.radiusPx * SPACING);
+      this.sampler.add(s, this.spacingPx());
     }
+  }
+
+  /** Dab spacing for the current stroke's brush: wider when a stamp is in use. */
+  private spacingPx(): number {
+    const st = this.settings.stamp[this.strokeBrush];
+    return this.settings.radiusPx * (st.id !== null ? st.spacing : SPACING);
   }
 
   endStroke(s: StrokeSample): void {
@@ -220,14 +337,14 @@ export class SculptTool {
       this.grabbing = false;
       this.grabHit = null;
     } else {
-      this.sampler.end(s, this.settings.radiusPx * SPACING);
+      this.sampler.end(s, this.spacingPx());
       this.applyPendingDabs(Infinity);
     }
     this.stroking = false;
     this.sampler.dabs.length = 0;
 
-    const stroke = this.recorder.end(this.mesh);
-    if (stroke) this.onStroke(stroke);
+    const stroke = this.recorder.end();
+    if (stroke) this.onStroke(stroke, this.strokeBrush === 'mask' ? 'mask' : 'sculpt');
     this.hover(s.x, s.y);
   }
 
@@ -317,6 +434,7 @@ export class SculptTool {
     const start = performance.now();
     const { settings } = this;
     let any = false;
+    const stencil = this.dabStencil();
 
     while (this.dabCursor < dabs.length) {
       // Always make progress, but don't start a dab that likely overruns the frame.
@@ -347,11 +465,15 @@ export class SculptTool {
           strength: kind === 'smooth' ? base * SMOOTH_SCALE : base * this.strokeSign,
           falloff: settings.falloff[kind],
           symmetryX: settings.symmetryX,
+          stamp: this.dabStamp(kind, x, y),
+          stencil,
+          smoothMask: this.smoothMask,
         },
         this.recorder,
       );
       if (touched.length > 0) {
-        this.sink.markDirty(this.normals.update(this.mesh, touched));
+        // Mask strokes change no positions, so normals stay as they are.
+        this.sink.markDirty(kind === 'mask' ? touched : this.normals.update(this.mesh, touched));
         any = true;
       }
       this.dabCostMs = this.dabCostMs * 0.8 + (performance.now() - dabStart) * 0.2;
@@ -363,6 +485,61 @@ export class SculptTool {
       this.dabCursor = 0;
     }
     return any || this.lastHit !== null;
+  }
+
+  /** The stamp for a dab at screen (x, y), oriented per the brush's rotation setting. */
+  private dabStamp(kind: BrushKind, x: number, y: number): DabStamp | null {
+    const st = this.settings.stamp[kind];
+    const entry = this.stamps.get(st.id);
+    const prevX = this.prevDabX,
+      prevY = this.prevDabY;
+    this.prevDabX = x;
+    this.prevDabY = y;
+    if (!entry) return null;
+
+    // Screen direction for +u: the stroke direction, or screen right.
+    let sx = 1,
+      sy = 0;
+    if (st.rotation === 'stroke' && Number.isFinite(prevX)) {
+      const len = Math.hypot(x - prevX, y - prevY);
+      if (len > 1e-6) {
+        sx = (x - prevX) / len;
+        sy = (y - prevY) / len;
+      }
+    }
+    const { right, up } = this.camera.basis();
+    // Screen y grows downward.
+    return {
+      stamp: entry.stamp,
+      dirX: right[0] * sx - up[0] * sy,
+      dirY: right[1] * sx - up[1] * sy,
+      dirZ: right[2] * sx - up[2] * sy,
+      angle: st.rotation === 'random' ? this.random() * Math.PI * 2 : 0,
+    };
+  }
+
+  /** The stencil for this frame's dabs: the current view and placement. */
+  private dabStencil(): DabStencil | null {
+    const st = this.settings.stencil;
+    const entry = this.stamps.get(st.id);
+    if (!entry) return null;
+    return {
+      stamp: entry.stamp,
+      viewProj: this.camera.viewProj(),
+      viewportWidth: this.camera.widthPx,
+      viewportHeight: this.camera.heightPx,
+      centerX: st.centerX,
+      centerY: st.centerY,
+      halfSize: st.size / 2,
+      angle: st.angle,
+      tile: st.tile,
+    };
+  }
+
+  /** Small deterministic PRNG for random stamp rotation (seeded per stroke). */
+  private random(): number {
+    this.rngState = (Math.imul(this.rngState, 1664525) + 1013904223) >>> 0;
+    return this.rngState / 4294967296;
   }
 
   private raycast(x: number, y: number): RayHit | null {

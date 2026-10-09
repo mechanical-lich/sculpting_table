@@ -1,3 +1,4 @@
+import { allocFloat32 } from './alloc';
 import { computeAllNormals } from './normals';
 
 /**
@@ -26,12 +27,15 @@ export interface Mesh {
   /** Source quads (four ids each), if the mesh was built from quads. Kept for subdivision. */
   quads: Uint32Array | null;
   adjacency: Adjacency;
+  /** Per vertex, 0 = free to sculpt, 1 = frozen. Brushes scale their effect by (1 - mask). */
+  mask: Float32Array;
 }
 
 export function createMesh(
   positions: Float32Array,
   indices: Uint32Array,
   quads: Uint32Array | null = null,
+  mask: Float32Array | null = null,
 ): Mesh {
   const vertexCount = positions.length / 3;
   const triangleCount = indices.length / 3;
@@ -44,6 +48,7 @@ export function createMesh(
     faceNormals: new Float32Array(triangleCount * 3),
     quads,
     adjacency: buildAdjacency(vertexCount, indices),
+    mask: mask ?? allocFloat32(vertexCount),
   };
   computeAllNormals(mesh);
   return mesh;

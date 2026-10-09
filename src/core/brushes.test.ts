@@ -149,7 +149,7 @@ describe('grab', () => {
     const ctx = setup();
     const before = ctx.mesh.positions.slice();
     const rec = new StrokeRecorder(ctx.mesh.vertexCount);
-    rec.begin();
+    rec.begin(ctx.mesh.positions);
     expect(ctx.engine.beginGrab(ctx.mesh, ctx.grid, 0, 0, 1, 0.3, false, 'smooth', rec)).toBe(true);
     const moved = ctx.engine.dragGrab(ctx.mesh, ctx.grid, 0.1, 0.2, 0.05);
 
@@ -171,7 +171,7 @@ describe('grab', () => {
     // Dragging back to zero restores the start exactly, and the recorder has it all.
     ctx.engine.dragGrab(ctx.mesh, ctx.grid, 0, 0, 0);
     expect(ctx.mesh.positions).toEqual(before);
-    const stroke = rec.end(ctx.mesh)!;
+    const stroke = rec.end()!;
     expect(stroke.indices.length).toBe(moved.length);
   });
 

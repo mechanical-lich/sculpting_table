@@ -7,7 +7,10 @@
   import { FALLOFFS } from '../core/falloff';
   import BrushIcon from './BrushIcon.svelte';
   import FalloffPicker from './FalloffPicker.svelte';
-  import { hotkeyLabel, IS_MAC } from './hotkeys';
+  import StampPicker from './StampPicker.svelte';
+  import StencilPanel from './StencilPanel.svelte';
+  import type { StampEntry } from '../tools/stamps';
+  import { hotkeyLabel, IS_MAC, keyLabel, STENCIL_KEY } from './hotkeys';
 
   let { controller }: { controller: AppController } = $props();
 
@@ -17,6 +20,7 @@
   let history = $state({ canUndo: false, canRedo: false });
   let stats = $state<Stats | null>(null);
   let level = $state<LevelInfo | null>(null);
+  let stampEntries = $state<readonly StampEntry[]>([]);
   let activeBrush = $derived<BrushKind>(settings?.brush ?? 'sculpt');
 
   $effect(() => {
@@ -24,9 +28,15 @@
       ...tool.settings,
       strength: { ...tool.settings.strength },
       falloff: { ...tool.settings.falloff },
+      stamp: Object.fromEntries(
+        Object.entries(tool.settings.stamp).map(([k, v]) => [k, { ...v }]),
+      ) as ToolSettings['stamp'],
+      stencil: { ...tool.settings.stencil },
     };
     level = controller.document.levelInfo();
+    stampEntries = [...tool.stamps.entries];
     const unsubs = [
+      tool.events.on('stamps', (e) => (stampEntries = [...e])),
       tool.events.on('settings', (s) => (settings = s)),
       controller.document.events.on('history', (h) => (history = h)),
       controller.document.events.on('level', (l) => (level = l)),
@@ -38,6 +48,8 @@
   const ctrl = IS_MAC ? '⌃' : 'Ctrl';
   const alt = IS_MAC ? '⌥' : 'Alt';
   const shift = IS_MAC ? '⇧' : 'Shift';
+  const altShift = IS_MAC ? '⌥⇧' : 'Alt+Shift';
+  const altCtrl = IS_MAC ? '⌥⌃' : 'Alt+Ctrl';
 
   function formatCount(n: number): string {
     return n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : `${Math.round(n / 1000)}k`;
@@ -134,6 +146,20 @@
       />
     </div>
 
+    {#if activeBrush !== 'grab'}
+      <div class="field">
+        <span>Stamp</span>
+        <StampPicker
+          entries={stampEntries}
+          value={settings.stamp[activeBrush]}
+          onselect={(id) => tool.setStamp(activeBrush, id)}
+          onrotation={(r) => tool.setStampRotation(activeBrush, r)}
+          onspacing={(v) => tool.setStampSpacing(activeBrush, v)}
+          onload={(label, stamp) => tool.addStamp(label, stamp)}
+        />
+      </div>
+    {/if}
+
     <label class="check">
       <input
         type="checkbox"
@@ -143,13 +169,43 @@
       <span>X symmetry <kbd>{hotkeyLabel('symmetry')}</kbd></span>
     </label>
 
+    <h2>Mask</h2>
+    <div class="mask-actions">
+      <button
+        onclick={() => controller.maskCommand('invert')}
+        title="Swap masked and unmasked areas">Invert</button
+      >
+      <button onclick={() => controller.maskCommand('clear')} title="Unmask everything"
+        >Clear</button
+      >
+      <button onclick={() => controller.maskCommand('all')} title="Mask everything">All</button>
+    </div>
+    <p class="hint">
+      {#if activeBrush === 'mask'}{ctrl} + drag erases the mask, {shift} + drag softens its edges.
+      {:else}Paint with the Mask brush to protect areas; Invert to sculpt only inside them.{/if}
+    </p>
+
+    <h2>Stencil</h2>
+    <StencilPanel
+      entries={stampEntries}
+      value={settings.stencil}
+      keyLabel={keyLabel(STENCIL_KEY)}
+      onselect={(id) => tool.setStencil(id)}
+      onload={(label, image) => tool.setStencil(tool.addStamp(label, image, false).id)}
+      onopacity={(o) => tool.setStencilOpacity(o)}
+      ontile={(t) => tool.setStencilTile(t)}
+      onreset={() => tool.resetStencilPlacement()}
+    />
+
     <h2>Controls</h2>
     <dl>
       <dt>{alt} + LMB</dt>
       <dd>Orbit</dd>
-      <dt>{alt} + MMB</dt>
+      <dt>{alt} + MMB, {altShift} + LMB</dt>
       <dd>Pan</dd>
-      <dt>{alt} + RMB / wheel</dt>
+      <dt>{alt} + RMB, {altCtrl} + LMB</dt>
+      <dd>Zoom</dd>
+      <dt>Wheel / pinch</dt>
       <dd>Zoom</dd>
       <dt>{shift} + drag</dt>
       <dd>Smooth</dd>
@@ -292,6 +348,14 @@
   .muted {
     color: var(--muted);
     margin-left: 4px;
+  }
+  .mask-actions {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 8px;
+  }
+  .mask-actions button {
+    flex: 1;
   }
   .hint {
     margin: -6px 0 14px;

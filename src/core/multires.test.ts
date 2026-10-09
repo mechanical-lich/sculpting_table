@@ -28,7 +28,7 @@ function sculpt(
   grid.buildFromMesh(mesh);
   const engine = new BrushEngine(mesh.vertexCount);
   const rec = new StrokeRecorder(mesh.vertexCount);
-  rec.begin();
+  rec.begin(mesh.positions);
   for (let i = 0; i < 3; i++) {
     engine.applyDab(
       mesh,
@@ -37,7 +37,7 @@ function sculpt(
       rec,
     );
   }
-  return rec.end(mesh)!;
+  return rec.end()!;
 }
 
 /** Largest distance from the origin minus 1, over a level. */
@@ -151,7 +151,7 @@ describe('Multires', () => {
       p1[i * 3] = z;
       p1[i * 3 + 2] = -x;
     }
-    m.commit(1, { target: p1, indices, before, after: p1.slice() });
+    m.commit(1, { target: p1, stride: 3, indices, before, after: p1.slice() });
     m.ensureCurrent(3);
 
     const p3 = m.levels[3].positions;

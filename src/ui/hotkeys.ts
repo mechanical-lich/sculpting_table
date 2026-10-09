@@ -33,13 +33,16 @@ export const HOTKEYS = [
 
 export type HotkeyId = (typeof HOTKEYS)[number]['id'];
 
+/** Held (not pressed) to move, rotate and scale the stencil, as in Mudbox. */
+export const STENCIL_KEY = 'KeyS';
+
 for (const h of HOTKEYS as readonly Hotkey[]) {
   if (h.primary && (RESERVED_WITH_PRIMARY.has(h.code) || h.code.startsWith('Digit'))) {
     throw new Error(`Hotkey ${h.id} uses a browser-reserved shortcut`);
   }
 }
 
-function isEditable(target: EventTarget | null): boolean {
+export function isEditable(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
   if (target.isContentEditable) return true;
   if (target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return true;
@@ -98,6 +101,11 @@ function codeLabel(code: string): string {
   if (code === 'PageUp') return 'PgUp';
   if (code === 'PageDown') return 'PgDn';
   return code;
+}
+
+/** Display label for a physical key code, following the user's layout. */
+export function keyLabel(code: string): string {
+  return codeLabel(code);
 }
 
 export function hotkeyLabel(id: HotkeyId): string {

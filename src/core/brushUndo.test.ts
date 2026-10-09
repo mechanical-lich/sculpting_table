@@ -43,12 +43,12 @@ describe('undo', () => {
     const stack = new UndoStack();
     const original = mesh.positions.slice();
 
-    recorder.begin();
+    recorder.begin(mesh.positions);
     for (let i = 0; i < 5; i++) {
       const touched = engine.applyDab(mesh, grid, dab({ x: 0.1 * i }), recorder);
       normals.update(mesh, touched);
     }
-    const stroke = recorder.end(mesh)!;
+    const stroke = recorder.end()!;
     expect(stroke).not.toBeNull();
     stack.push(asEntry(stroke));
     const sculpted = mesh.positions.slice();
@@ -66,21 +66,21 @@ describe('undo', () => {
     const { mesh, grid, engine, recorder } = setup(8);
     const stack = new UndoStack();
     for (let s = 0; s < 2; s++) {
-      recorder.begin();
+      recorder.begin(mesh.positions);
       engine.applyDab(mesh, grid, dab({}), recorder);
-      stack.push(asEntry(recorder.end(mesh)!));
+      stack.push(asEntry(recorder.end()!));
     }
     applyEntry(stack.undo()!, 'before');
-    recorder.begin();
+    recorder.begin(mesh.positions);
     engine.applyDab(mesh, grid, dab({ kind: 'smooth' }), recorder);
-    stack.push(asEntry(recorder.end(mesh)!));
+    stack.push(asEntry(recorder.end()!));
     expect(stack.canRedo).toBe(false);
   });
 
   it('returns null for an empty stroke', () => {
     const { mesh, recorder } = setup(4);
-    recorder.begin();
-    expect(recorder.end(mesh)).toBeNull();
+    recorder.begin(mesh.positions);
+    expect(recorder.end()).toBeNull();
   });
 });
 

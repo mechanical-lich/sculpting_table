@@ -1,5 +1,7 @@
 import { FALLOFFS, type FalloffKind } from './falloff';
 import { FloatList, IndexList, StampSet } from './lists';
+import { sampleStamp, type Stamp } from './stamp';
+import { stencilAt, type DabStencil } from './stencil';
 import type { Mesh } from './mesh';
 import type { SpatialGrid } from './spatialGrid';
 import type { StrokeRecorder } from './undo';
@@ -14,7 +16,8 @@ export type BrushKind =
   | 'inflate'
   | 'scrape'
   | 'knife'
-  | 'wax';
+  | 'wax'
+  | 'mask';
 
 export interface BrushDef {
   label: string;
@@ -85,6 +88,12 @@ export const BRUSHES: Record<BrushKind, BrushDef> = {
     defaultStrength: 0.5,
     defaultFalloff: 'smooth',
   },
+  mask: {
+    label: 'Mask',
+    hint: 'Freeze areas so other brushes leave them alone',
+    defaultStrength: 1,
+    defaultFalloff: 'smooth',
+  },
 };
 
 export const BRUSH_ORDER = Object.keys(BRUSHES) as BrushKind[];
@@ -103,8 +112,28 @@ export interface Dab {
   /** Strength, already scaled by pressure. Negative inverts (not used by Smooth). */
   strength: number;
   falloff: FalloffKind;
+  /** Optional stamp modulating strength across the brush. */
+  stamp?: DabStamp | null;
+  /** Optional screen-space stencil masking strength. */
+  stencil?: DabStencil | null;
+  /** Mask brush only: smooth the mask's edges instead of painting it. */
+  smoothMask?: boolean;
   /** Also apply mirrored across x = 0. */
   symmetryX: boolean;
+}
+
+/** How a stamp sits on one dab. */
+export interface DabStamp {
+  stamp: Stamp;
+  /**
+   * World direction for the stamp's +u axis (e.g. the stroke direction, or
+   * screen right). It is projected into the surface plane under the brush.
+   */
+  dirX: number;
+  dirY: number;
+  dirZ: number;
+  /** Extra rotation about the surface normal, in radians. */
+  angle: number;
 }
 
 // Per-dab rates at full strength. Steps are fractions of the radius; rates
@@ -168,7 +197,14 @@ export class BrushEngine {
       dab.falloff,
     );
     if (touched.length === 0) return touched;
-    recorder?.capture(mesh, touched);
+    recorder?.capture(touched);
+    if (dab.stamp) this.applyStamp(mesh, dab, dab.stamp, touched);
+    if (dab.stencil) this.applyStencil(mesh, dab.stencil, touched);
+    if (dab.kind === 'mask') {
+      this.paintMask(mesh, dab, touched);
+      return touched;
+    }
+    this.applyMask(mesh, touched);
 
     if (dab.kind === 'smooth') this.smooth(mesh, dab, touched);
     else this.displace(mesh, dab, touched);
@@ -192,6 +228,7 @@ export class BrushEngine {
     recorder: StrokeRecorder | null,
   ): boolean {
     const touched = this.gatherBoth(mesh, grid, x, y, z, radius, symmetryX, falloff);
+    this.applyMask(mesh, touched);
     const n = touched.length;
     this.grabIndices = touched.slice();
     this.grabWeights = new Float32Array(n * 2);
@@ -205,7 +242,7 @@ export class BrushEngine {
       this.grabOrigin[i * 3 + 1] = p[v * 3 + 1];
       this.grabOrigin[i * 3 + 2] = p[v * 3 + 2];
     }
-    recorder?.capture(mesh, this.grabIndices);
+    recorder?.capture(this.grabIndices);
     return n > 0;
   }
 
@@ -290,6 +327,170 @@ export class BrushEngine {
       } else {
         w[v] = f;
       }
+    }
+  }
+
+  // --- stamps ----------------------------------------------------------------
+
+  /**
+   * Multiplies each vertex's falloff weights by the stamp, mapped onto the
+   * plane under the brush: u along the projected stamp direction, v along
+   * normal × u, both scaled so the radius spans [-1, 1]. The mirror side uses
+   * the mirrored frame and hit point, so a vertex and its mirror image sample
+   * the same stamp value.
+   */
+  private applyStamp(mesh: Mesh, dab: Dab, st: DabStamp, touched: Uint32Array): void {
+    const p = mesh.positions;
+    const n = mesh.normals;
+    const w = this.weight;
+    const wm = this.weightMirror;
+
+    let nx = 0,
+      ny = 0,
+      nz = 0;
+    for (let i = 0; i < touched.length; i++) {
+      const v = touched[i];
+      const f = w[v],
+        fm = wm[v];
+      nx += (f - fm) * n[v * 3];
+      ny += (f + fm) * n[v * 3 + 1];
+      nz += (f + fm) * n[v * 3 + 2];
+    }
+    const nl = Math.hypot(nx, ny, nz);
+    if (nl < 1e-12) return;
+    nx /= nl;
+    ny /= nl;
+    nz /= nl;
+
+    // u axis: stamp direction projected into the tangent plane, then rotated.
+    let tx = st.dirX,
+      ty = st.dirY,
+      tz = st.dirZ;
+    const along = tx * nx + ty * ny + tz * nz;
+    tx -= nx * along;
+    ty -= ny * along;
+    tz -= nz * along;
+    let tl = Math.hypot(tx, ty, tz);
+    if (tl < 1e-9) {
+      // Direction along the normal: any tangent will do.
+      tx = Math.abs(nx) < 0.9 ? 0 : -nz;
+      ty = Math.abs(nx) < 0.9 ? -nz : 0;
+      tz = Math.abs(nx) < 0.9 ? ny : nx;
+      tl = Math.hypot(tx, ty, tz);
+    }
+    tx /= tl;
+    ty /= tl;
+    tz /= tl;
+    // b = n × t; then rotate (t, b) by the angle.
+    const bx0 = ny * tz - nz * ty,
+      by0 = nz * tx - nx * tz,
+      bz0 = nx * ty - ny * tx;
+    const c = Math.cos(st.angle),
+      sn = Math.sin(st.angle);
+    const ux = tx * c + bx0 * sn,
+      uy = ty * c + by0 * sn,
+      uz = tz * c + bz0 * sn;
+    const vx = bx0 * c - tx * sn,
+      vy = by0 * c - ty * sn,
+      vz = bz0 * c - tz * sn;
+
+    const inv = 1 / dab.radius;
+    const hx = dab.x,
+      hy = dab.y,
+      hz = dab.z;
+    for (let i = 0; i < touched.length; i++) {
+      const v = touched[i];
+      const o = v * 3;
+      if (w[v] > 0) {
+        const dx = p[o] - hx,
+          dy = p[o + 1] - hy,
+          dz = p[o + 2] - hz;
+        w[v] *= sampleStamp(
+          st.stamp,
+          (dx * ux + dy * uy + dz * uz) * inv,
+          (dx * vx + dy * vy + dz * vz) * inv,
+        );
+      }
+      if (wm[v] > 0) {
+        // Mirror frame: hit (-hx, hy, hz), axes with x negated.
+        const dx = p[o] + hx,
+          dy = p[o + 1] - hy,
+          dz = p[o + 2] - hz;
+        wm[v] *= sampleStamp(
+          st.stamp,
+          (-dx * ux + dy * uy + dz * uz) * inv,
+          (-dx * vx + dy * vy + dz * vz) * inv,
+        );
+      }
+    }
+  }
+
+  /**
+   * Multiplies weights by the stencil at each vertex's screen position. The
+   * mirror-side weight of v uses the stencil at mirror(v), so the pattern
+   * pressed on one side is reproduced exactly on the other.
+   */
+  private applyStencil(mesh: Mesh, st: DabStencil, touched: Uint32Array): void {
+    const p = mesh.positions;
+    const w = this.weight;
+    const wm = this.weightMirror;
+    for (let i = 0; i < touched.length; i++) {
+      const v = touched[i];
+      const o = v * 3;
+      if (w[v] > 0) w[v] *= stencilAt(st, p[o], p[o + 1], p[o + 2]);
+      if (wm[v] > 0) wm[v] *= stencilAt(st, -p[o], p[o + 1], p[o + 2]);
+    }
+  }
+
+  // --- masking ---------------------------------------------------------------
+
+  /** Scales both side weights by how unmasked each vertex is. */
+  private applyMask(mesh: Mesh, touched: Uint32Array): void {
+    const m = mesh.mask;
+    const w = this.weight;
+    const wm = this.weightMirror;
+    for (let i = 0; i < touched.length; i++) {
+      const v = touched[i];
+      const free = 1 - m[v];
+      if (free < 1) {
+        w[v] *= free;
+        wm[v] *= free;
+      }
+    }
+  }
+
+  /**
+   * The Mask brush: adds (or, with negative strength, removes) mask under
+   * the brush, or smooths it toward the neighbor average.
+   */
+  private paintMask(mesh: Mesh, dab: Dab, touched: Uint32Array): void {
+    const m = mesh.mask;
+    const w = this.weight;
+    const wm = this.weightMirror;
+    if (dab.smoothMask) {
+      const { neighborOffsets, neighbors } = mesh.adjacency;
+      const strength = Math.min(1, Math.abs(dab.strength));
+      // Jacobi: all targets from the mask before this dab.
+      this.scratch.clear();
+      for (let i = 0; i < touched.length; i++) {
+        const v = touched[i];
+        const s0 = neighborOffsets[v],
+          s1 = neighborOffsets[v + 1];
+        let sum = 0;
+        for (let k = s0; k < s1; k++) sum += m[neighbors[k]];
+        this.scratch.push(s1 > s0 ? sum / (s1 - s0) : m[v]);
+      }
+      const targets = this.scratch.data;
+      for (let i = 0; i < touched.length; i++) {
+        const v = touched[i];
+        m[v] += (targets[i] - m[v]) * Math.max(w[v], wm[v]) * strength;
+      }
+      return;
+    }
+    for (let i = 0; i < touched.length; i++) {
+      const v = touched[i];
+      const next = m[v] + dab.strength * Math.max(w[v], wm[v]);
+      m[v] = next < 0 ? 0 : next > 1 ? 1 : next;
     }
   }
 
@@ -528,6 +729,7 @@ function sideDisplacement(
       return;
     }
     case 'smooth':
+    case 'mask':
       return;
   }
 }

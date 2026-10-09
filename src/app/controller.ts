@@ -12,8 +12,34 @@ import {
 } from '../tools/navigation';
 import { SculptTool } from '../tools/sculptTool';
 import type { StrokeSample } from '../tools/stroke';
-import { IS_MAC, learnKey, matchHotkey, type HotkeyId } from '../ui/hotkeys';
-import type { SculptDocument } from './document';
+import {
+  IS_MAC,
+  isEditable,
+  learnKey,
+  matchHotkey,
+  STENCIL_KEY,
+  type HotkeyId,
+} from '../ui/hotkeys';
+import type { MaskCommand, SculptDocument } from './document';
+
+/** An SVG cursor drawn white with a dark outline, so it reads on any background. */
+function svgCursor(path: string, fallback: string): string {
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" stroke-linecap="round" stroke-linejoin="round">` +
+    `<path d="${path}" stroke="#111" stroke-width="4"/><path d="${path}" stroke="#fff" stroke-width="2"/></svg>`;
+  return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 12 12, ${fallback}`;
+}
+
+/** Cursors for camera actions. Orbit is a curved double arrow (no CSS keyword for it). */
+const NAV_CURSORS: Record<NavAction, string> = {
+  orbit: svgCursor(
+    'M4 11 A8 6 0 0 0 20 11 M1.5 13.5 L4 10 L7 12.5 M17 12.5 L20 10 L22.5 13.5',
+    'move',
+  ),
+  pan: 'move',
+  // Zoom drags along the diagonal: right/down moves in.
+  dolly: 'nwse-resize',
+};
 
 export interface Stats {
   fps: number;
@@ -38,6 +64,15 @@ export class AppController {
   private needsRender = true;
   private dirtyDocument = false;
   private navAction: NavAction | null = null;
+  /** True while the stencil key is held. */
+  private stencilKey = false;
+  /** True while Alt/Option is held: the mouse drives the camera. */
+  private altHeld = false;
+  /** Latest modifier state, so the Alt cursor can show pan/zoom before clicking. */
+  private mods = { altKey: false, shiftKey: false, ctrlKey: false, metaKey: false };
+  /** Mudbox stencil drags: S + LMB rotate, S + MMB move, S + RMB scale. */
+  private stencilAction: 'rotate' | 'move' | 'scale' | null = null;
+  private stencilImageId: string | null = null;
   private activePointer: number | null = null;
   private lastX = 0;
   private lastY = 0;
@@ -54,8 +89,8 @@ export class AppController {
     readonly document: SculptDocument,
   ) {
     this.rect = canvas.getBoundingClientRect();
-    this.tool = new SculptTool(document.mesh, this.camera, renderer, (stroke) =>
-      document.commitStroke(stroke),
+    this.tool = new SculptTool(document.mesh, this.camera, renderer, (stroke, kind) =>
+      document.commitStroke(stroke, kind),
     );
     document.attach({
       setMesh: (mesh) => {
@@ -67,12 +102,23 @@ export class AppController {
         this.tool.meshEdited(vertices);
         this.needsRender = true;
       },
+      maskEdited: (vertices) => {
+        renderer.markDirty(vertices);
+        this.needsRender = true;
+      },
     });
     document.events.on('edited', () => {
       this.dirtyDocument = true;
       this.needsRender = true;
     });
-    this.tool.events.on('settings', () => (this.needsRender = true));
+    this.tool.events.on('settings', (s) => {
+      this.needsRender = true;
+      // Keep the overlay texture in step with the chosen stencil image.
+      if (s.stencil.id !== this.stencilImageId) {
+        this.stencilImageId = s.stencil.id;
+        renderer.setStencilImage(this.tool.stamps.get(s.stencil.id)?.stamp ?? null);
+      }
+    });
     renderer.setMesh(document.mesh);
     this.frame();
     this.bindInput();
@@ -123,6 +169,11 @@ export class AppController {
     }
   }
 
+  /** Invert, clear or fill the mask (not mid-stroke). */
+  maskCommand(cmd: MaskCommand): void {
+    if (!this.tool.isStroking) this.document.maskCommand(cmd);
+  }
+
   frame(): void {
     const mesh = this.document.mesh;
     const b = computeBounds(mesh.positions, mesh.vertexCount);
@@ -155,7 +206,13 @@ export class AppController {
         eye,
         keyLight: key,
         fillLight: fill,
-        brush: this.navAction ? null : this.tool.overlay(),
+        // No brush ring while the mouse drives the camera or the stencil.
+        brush:
+          this.navAction || this.stencilAction || (this.altHeld && !this.tool.isStroking)
+            ? null
+            : this.tool.overlay(),
+        stencil: this.stencilOverlay(),
+        symmetryX: this.tool.settings.symmetryX,
       });
       this.statFrames++;
     }
@@ -217,7 +274,10 @@ export class AppController {
 
     this.listen(window, 'keydown', (e) => this.onKey(e, true));
     this.listen(window, 'keyup', (e) => this.onKey(e, false));
-    this.listen(window, 'blur', () => this.syncModifiers({ shiftKey: false, ctrlKey: false }));
+    this.listen(window, 'blur', () => {
+      this.syncModifiers({ shiftKey: false, ctrlKey: false, altKey: false, metaKey: false });
+      this.setStencilKey(false);
+    });
     this.listen(window, 'beforeunload', (e) => {
       if (this.dirtyDocument) e.preventDefault();
     });
@@ -244,8 +304,11 @@ export class AppController {
     const nav = this.nav.match({ ...modifiersOf(e), button });
     [this.lastX, this.lastY] = this.localPoint(e);
 
-    if (nav) {
+    if (this.stencilKey && this.tool.settings.stencil.id !== null) {
+      this.stencilAction = button === 0 ? 'rotate' : button === 1 ? 'move' : 'scale';
+    } else if (nav) {
       this.navAction = nav;
+      this.updateCursor();
     } else if (button === 0) {
       this.tool.beginStroke(this.sample(e), { invert: e.ctrlKey, smooth: e.shiftKey });
     } else {
@@ -265,6 +328,13 @@ export class AppController {
     if (this.activePointer !== null && e.pointerId !== this.activePointer) return;
     const [x, y] = this.localPoint(e);
 
+    if (this.stencilAction) {
+      this.dragStencil(this.stencilAction, this.lastX, this.lastY, x, y);
+      this.lastX = x;
+      this.lastY = y;
+      this.needsRender = true;
+      return;
+    }
     if (this.navAction) {
       applyNavDrag(this.camera, this.navAction, x - this.lastX, y - this.lastY);
       this.lastX = x;
@@ -290,8 +360,12 @@ export class AppController {
     if (e.pointerId !== this.activePointer) return;
     this.activePointer = null;
     if (this.canvas.hasPointerCapture(e.pointerId)) this.canvas.releasePointerCapture(e.pointerId);
-    if (this.navAction) {
+    if (this.stencilAction) {
+      this.stencilAction = null;
+      this.tool.hover(this.lastX, this.lastY);
+    } else if (this.navAction) {
       this.navAction = null;
+      this.updateCursor();
       this.afterCameraMove();
     } else {
       this.tool.endStroke(this.sample(e));
@@ -303,6 +377,10 @@ export class AppController {
     // Keep Alt from focusing the browser menu bar (Windows, Firefox).
     if (e.key === 'Alt') e.preventDefault();
     this.syncModifiers(e);
+    if (e.code === STENCIL_KEY && !isEditable(e.target)) {
+      this.setStencilKey(down && !e.ctrlKey && !e.metaKey && !e.altKey);
+      return;
+    }
     if (!down) return;
     learnKey(e);
     const cmd = matchHotkey(e);
@@ -312,8 +390,86 @@ export class AppController {
     }
   }
 
-  private syncModifiers(e: { shiftKey: boolean; ctrlKey: boolean }): void {
+  private setStencilKey(held: boolean): void {
+    if (held === this.stencilKey) return;
+    this.stencilKey = held;
+    this.updateCursor();
+  }
+
+  /** The cursor says what the mouse will do: camera, stencil, or sculpt (default). */
+  private updateCursor(): void {
+    let cursor = '';
+    if (this.navAction) cursor = NAV_CURSORS[this.navAction];
+    else if (this.stencilAction) cursor = 'move';
+    else if (this.altHeld && !this.tool.isStroking) {
+      // What a left-button drag would do with the modifiers held right now.
+      cursor = NAV_CURSORS[this.nav.match({ ...this.mods, button: 0 }) ?? 'orbit'];
+    } else if (this.stencilKey && this.tool.settings.stencil.id !== null) cursor = 'move';
+    if (this.canvas.style.cursor !== cursor) this.canvas.style.cursor = cursor;
+  }
+
+  /** Applies one pointer step of a stencil drag (CSS pixels). */
+  private dragStencil(
+    action: 'rotate' | 'move' | 'scale',
+    x0: number,
+    y0: number,
+    x1: number,
+    y1: number,
+  ): void {
+    const st = this.tool.settings.stencil;
+    let { centerX, centerY, size, angle } = st;
+    if (action === 'move') {
+      centerX += x1 - x0;
+      centerY += y1 - y0;
+    } else if (action === 'rotate') {
+      // Turn by the change in the pointer's angle around the stencil center.
+      angle += Math.atan2(y1 - centerY, x1 - centerX) - Math.atan2(y0 - centerY, x0 - centerX);
+    } else {
+      // Drag right or up to grow.
+      size *= Math.exp((x1 - x0 - (y1 - y0)) * 0.005);
+    }
+    this.tool.setStencilPlacement(centerX, centerY, size, angle);
+  }
+
+  /** The stencil overlay in framebuffer pixels, or null when no stencil is set. */
+  private stencilOverlay() {
+    const st = this.tool.settings.stencil;
+    if (st.id === null) return null;
+    const ratio = this.canvas.width / Math.max(1, this.camera.widthPx);
+    return {
+      centerX: st.centerX * ratio,
+      centerY: st.centerY * ratio,
+      halfSize: (st.size / 2) * ratio,
+      angle: st.angle,
+      opacity: st.opacity,
+      tile: st.tile,
+    };
+  }
+
+  private syncModifiers(e: {
+    shiftKey: boolean;
+    ctrlKey: boolean;
+    altKey?: boolean;
+    metaKey?: boolean;
+  }): void {
     this.tool.setModifiers({ invert: e.ctrlKey, smooth: e.shiftKey });
+    const altKey = e.altKey ?? this.mods.altKey;
+    const m = this.mods;
+    if (
+      altKey !== m.altKey ||
+      e.shiftKey !== m.shiftKey ||
+      e.ctrlKey !== m.ctrlKey ||
+      (e.metaKey ?? m.metaKey) !== m.metaKey
+    ) {
+      this.mods = {
+        altKey,
+        shiftKey: e.shiftKey,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey ?? m.metaKey,
+      };
+      this.altHeld = altKey;
+      this.updateCursor();
+    }
     this.needsRender = true;
   }
 

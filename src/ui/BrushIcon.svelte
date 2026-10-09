@@ -15,6 +15,8 @@
     scrape: 'M3 16 H6 L8 11 H13 L15 16 H21 M5 8 H16',
     knife: 'M3 9 H10.5 L12 20 L13.5 9 H21',
     wax: 'M3 18 H21 M5 14.5 H19 M8 11 H16',
+    // A snowflake: Mudbox calls masking "freeze".
+    mask: 'M12 3 V21 M4.2 7.5 L19.8 16.5 M4.2 16.5 L19.8 7.5 M10 4.5 L12 6.5 L14 4.5 M10 19.5 L12 17.5 L14 19.5',
   };
 </script>
 

@@ -37,6 +37,11 @@ export interface Level {
   displacement: Float32Array | null;
   /** True when `positions` is out of date with respect to the levels below. */
   stale: boolean;
+  /**
+   * Mask for this level (0 free .. 1 frozen). Only the active level's mask is
+   * authoritative; `transferMask` carries it to another level on a switch.
+   */
+  mask: Float32Array;
 }
 
 function makeLevel(
@@ -55,6 +60,7 @@ function makeLevel(
     positions,
     displacement,
     stale: false,
+    mask: allocFloat32(topology.vertexCount),
   };
 }
 
@@ -107,6 +113,7 @@ export class Multires {
     const topology = refineTopology(parent.topology, et);
     const positions = subdividePositions(parent.topology, et, parent.positions);
     this.levels.push(makeLevel(topology, positions, allocFloat32(topology.vertexCount * 3)));
+    this.transferMask(this.top - 1, this.top);
     return this.top;
   }
 
@@ -127,7 +134,37 @@ export class Multires {
   createLevelMesh(k: number): Mesh {
     const lvl = this.levels[k];
     const quads = isAllQuads(lvl.topology) ? lvl.topology.faceVerts : null;
-    return createMesh(lvl.positions, lvl.triangles, quads);
+    return createMesh(lvl.positions, lvl.triangles, quads, lvl.mask);
+  }
+
+  /**
+   * Copies level `from`'s mask onto level `to`, one step at a time. Going
+   * down, each vertex takes its vertex child's value (child v = parent v), so
+   * the result is exact. Going up, children interpolate their parents with
+   * the subdivision stencils, so mask edges come out smooth.
+   */
+  transferMask(from: number, to: number): void {
+    for (let j = from; j > to; j--) {
+      const coarse = this.levels[j - 1].mask;
+      coarse.set(this.levels[j].mask.subarray(0, coarse.length));
+    }
+    for (let j = from; j < to; j++) {
+      const parent = this.levels[j];
+      const fine = this.levels[j + 1].mask;
+      const pm = parent.mask;
+      if (!pm.some((v) => v !== 0)) {
+        fine.fill(0);
+        continue;
+      }
+      for (let c = 0; c < fine.length; c++) {
+        childStencil(parent.topology, parent.edges!, c, this.stencil);
+        const ids = this.stencil.ids.data,
+          ws = this.stencil.weights.data;
+        let v = 0;
+        for (let s = 0; s < this.stencil.ids.length; s++) v += ws[s] * pm[ids[s]];
+        fine[c] = v < 0 ? 0 : v > 1 ? 1 : v;
+      }
+    }
   }
 
   /**
@@ -192,14 +229,20 @@ export class Multires {
           nextDelta[i * 3 + c] = d;
         }
       }
-      patches.push({ target: pp, indices: pIds, before, after: gather(pp, pIds) });
+      patches.push({ target: pp, stride: 3, indices: pIds, before, after: gather(pp, pIds) });
 
       // 2. Re-displace level j where P, Q or the frame changed; P_j stays fixed.
       const region = this.redisplaceRegion(j, ids, pIds);
       const D = lvl.displacement!;
       const dBefore = gather(D, region);
       this.redisplace(j, region);
-      patches.push({ target: D, indices: region, before: dBefore, after: gather(D, region) });
+      patches.push({
+        target: D,
+        stride: 3,
+        indices: region,
+        before: dBefore,
+        after: gather(D, region),
+      });
 
       ids = pIds;
       delta = nextDelta;

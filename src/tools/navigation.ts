@@ -19,12 +19,16 @@ export interface NavPreset {
   }): NavAction | null;
 }
 
-/** Mudbox/Maya default: Alt + LMB orbit, Alt + MMB pan, Alt + RMB dolly. */
+/**
+ * Mudbox/Maya default: Alt + LMB orbit, Alt + MMB pan, Alt + RMB dolly.
+ * For mice and trackpads without those buttons (common on Macs), the left
+ * button also pans with Alt + Shift and dollies with Alt + Ctrl.
+ */
 export const MUDBOX_NAV: NavPreset = {
   name: 'Mudbox',
   match(e) {
     if (!e.altKey) return null;
-    if (e.button === 0) return 'orbit';
+    if (e.button === 0) return e.shiftKey ? 'pan' : e.ctrlKey ? 'dolly' : 'orbit';
     if (e.button === 1) return 'pan';
     if (e.button === 2) return 'dolly';
     return null;
