@@ -26,6 +26,9 @@ export const HOTKEYS = [
   { id: 'radiusUp', code: 'BracketRight', description: 'Larger brush' },
   { id: 'frame', code: 'KeyF', description: 'Frame model' },
   { id: 'symmetry', code: 'KeyX', description: 'Toggle X symmetry' },
+  { id: 'levelUp', code: 'PageUp', description: 'Higher subdivision level' },
+  { id: 'levelDown', code: 'PageDown', description: 'Lower subdivision level' },
+  { id: 'addLevel', code: 'KeyD', shift: true, description: 'Add subdivision level' },
 ] as const satisfies readonly Hotkey[];
 
 export type HotkeyId = (typeof HOTKEYS)[number]['id'];
@@ -92,6 +95,8 @@ function codeLabel(code: string): string {
   if (code.startsWith('Digit')) return code.slice(5);
   if (code === 'BracketLeft') return '[';
   if (code === 'BracketRight') return ']';
+  if (code === 'PageUp') return 'PgUp';
+  if (code === 'PageDown') return 'PgDn';
   return code;
 }
 

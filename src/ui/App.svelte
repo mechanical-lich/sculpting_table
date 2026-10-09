@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { AppController, Stats } from '../app/controller';
+  import type { LevelInfo } from '../app/document';
   import type { BrushKind } from '../core/brush';
   import type { ToolSettings } from '../tools/sculptTool';
   import { RADIUS_MAX_PX, RADIUS_MIN_PX } from '../tools/sculptTool';
@@ -12,13 +13,16 @@
   let settings = $state<ToolSettings | null>(null);
   let history = $state({ canUndo: false, canRedo: false });
   let stats = $state<Stats | null>(null);
+  let level = $state<LevelInfo | null>(null);
   let activeBrush = $derived<BrushKind>(settings?.brush ?? 'sculpt');
 
   $effect(() => {
     settings = { ...tool.settings, strength: { ...tool.settings.strength } };
+    level = controller.document.levelInfo();
     const unsubs = [
       tool.events.on('settings', (s) => (settings = s)),
-      tool.events.on('history', (h) => (history = h)),
+      controller.document.events.on('history', (h) => (history = h)),
+      controller.document.events.on('level', (l) => (level = l)),
       controller.events.on('stats', (s) => (stats = s)),
     ];
     return () => unsubs.forEach((u) => u());
@@ -32,6 +36,10 @@
   const ctrl = IS_MAC ? '⌃' : 'Ctrl';
   const alt = IS_MAC ? '⌥' : 'Alt';
   const shift = IS_MAC ? '⇧' : 'Shift';
+
+  function formatCount(n: number): string {
+    return n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : `${Math.round(n / 1000)}k`;
+  }
 </script>
 
 <div class="topbar">
@@ -55,10 +63,32 @@
       >Frame</button
     >
   </div>
+  {#if level}
+    <div class="group level" aria-label="Subdivision level">
+      <button
+        disabled={level.level === 0}
+        onclick={() => controller.run('levelDown')}
+        title="Lower level ({hotkeyLabel('levelDown')})">−</button
+      >
+      <span class="level-label">Level {level.level} / {level.top}</span>
+      <button
+        disabled={level.level === level.top}
+        onclick={() => controller.run('levelUp')}
+        title="Higher level ({hotkeyLabel('levelUp')})">+</button
+      >
+      <button
+        disabled={level.nextTriangles === null}
+        onclick={() => controller.run('addLevel')}
+        title={level.nextTriangles === null
+          ? 'Another level would exceed the 5M triangle budget'
+          : `Add a level: ${(level.nextTriangles / 1e6).toFixed(1)}M triangles (${hotkeyLabel('addLevel')})`}
+        >Subdivide</button
+      >
+    </div>
+  {/if}
   <span class="stats">
-    {#if stats}
-      {(stats.triangles / 1000).toFixed(0)}k tris · {stats.fps} fps · {stats.frameMs.toFixed(1)} ms
-    {/if}
+    {#if level}{formatCount(level.triangles)} tris{/if}
+    {#if stats}· {stats.fps} fps · {stats.frameMs.toFixed(1)} ms{/if}
   </span>
 </div>
 
@@ -113,6 +143,10 @@
       <dd>Invert</dd>
       <dt>{hotkeyLabel('frame')}</dt>
       <dd>Frame model</dd>
+      <dt>{hotkeyLabel('levelUp')} / {hotkeyLabel('levelDown')}</dt>
+      <dd>Change level</dd>
+      <dt>{hotkeyLabel('addLevel')}</dt>
+      <dd>Subdivide</dd>
     </dl>
   </aside>
 
@@ -145,13 +179,25 @@
   .title {
     font-weight: 600;
     letter-spacing: 0.02em;
+    white-space: nowrap;
   }
   .group {
     display: flex;
     gap: 4px;
   }
+  .level {
+    align-items: center;
+  }
+  .level-label {
+    min-width: 76px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
   .stats {
     margin-left: auto;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
     color: var(--muted);
     font-variant-numeric: tabular-nums;
   }

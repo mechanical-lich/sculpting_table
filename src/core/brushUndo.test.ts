@@ -4,7 +4,7 @@ import { createMesh } from './mesh';
 import { NormalUpdater } from './normals';
 import { createQuadSphere } from './quadSphere';
 import { SpatialGrid } from './spatialGrid';
-import { StrokeRecorder, UndoStack } from './undo';
+import { applyEntry, StrokeRecorder, UndoStack, type UndoEntry } from './undo';
 
 function setup(segments = 16) {
   const s = createQuadSphere(segments);
@@ -31,6 +31,11 @@ const dab = (over: Partial<Dab>): Dab => ({
   ...over,
 });
 
+const asEntry = (stroke: UndoEntry['patches'][number]): UndoEntry => ({
+  level: 0,
+  patches: [stroke],
+});
+
 describe('undo', () => {
   it('round-trips a multi-dab stroke exactly', () => {
     const { mesh, grid, engine, normals, recorder } = setup();
@@ -42,17 +47,17 @@ describe('undo', () => {
       const touched = engine.applyDab(mesh, grid, dab({ x: 0.1 * i }), recorder);
       normals.update(mesh, touched);
     }
-    const entry = recorder.end(mesh)!;
-    expect(entry).not.toBeNull();
-    stack.push(entry);
+    const stroke = recorder.end(mesh)!;
+    expect(stroke).not.toBeNull();
+    stack.push(asEntry(stroke));
     const sculpted = mesh.positions.slice();
     expect(sculpted).not.toEqual(original);
 
-    expect(stack.undo(mesh)).not.toBeNull();
+    applyEntry(stack.undo()!, 'before');
     expect(mesh.positions).toEqual(original);
     expect(stack.canRedo).toBe(true);
 
-    expect(stack.redo(mesh)).not.toBeNull();
+    applyEntry(stack.redo()!, 'after');
     expect(mesh.positions).toEqual(sculpted);
   });
 
@@ -62,12 +67,12 @@ describe('undo', () => {
     for (let s = 0; s < 2; s++) {
       recorder.begin();
       engine.applyDab(mesh, grid, dab({}), recorder);
-      stack.push(recorder.end(mesh)!);
+      stack.push(asEntry(recorder.end(mesh)!));
     }
-    stack.undo(mesh);
+    applyEntry(stack.undo()!, 'before');
     recorder.begin();
     engine.applyDab(mesh, grid, dab({ kind: 'smooth' }), recorder);
-    stack.push(recorder.end(mesh)!);
+    stack.push(asEntry(recorder.end(mesh)!));
     expect(stack.canRedo).toBe(false);
   });
 

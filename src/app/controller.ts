@@ -1,4 +1,4 @@
-import { computeBounds, type Mesh } from '../core/mesh';
+import { computeBounds } from '../core/mesh';
 import type { Vec3 } from '../core/math';
 import type { Renderer } from '../gpu/renderer';
 import { Camera } from '../tools/camera';
@@ -13,13 +13,12 @@ import {
 import { SculptTool } from '../tools/sculptTool';
 import type { StrokeSample } from '../tools/stroke';
 import { IS_MAC, learnKey, matchHotkey, type HotkeyId } from '../ui/hotkeys';
+import type { SculptDocument } from './document';
 
 export interface Stats {
   fps: number;
   /** Worst CPU time per frame over the sample window, in ms. */
   frameMs: number;
-  triangles: number;
-  vertices: number;
 }
 
 export interface ControllerEvents extends Record<string, unknown> {
@@ -27,8 +26,8 @@ export interface ControllerEvents extends Record<string, unknown> {
 }
 
 /**
- * Wires the canvas, camera, sculpt tool and renderer together and runs the
- * frame loop. Owns no mesh logic itself.
+ * Wires the canvas, camera, sculpt tool, document and renderer together and
+ * runs the frame loop. Owns no mesh logic itself.
  */
 export class AppController {
   readonly camera = new Camera();
@@ -52,16 +51,29 @@ export class AppController {
   constructor(
     private readonly canvas: HTMLCanvasElement,
     private readonly renderer: Renderer,
-    private readonly mesh: Mesh,
+    readonly document: SculptDocument,
   ) {
     this.rect = canvas.getBoundingClientRect();
-    this.tool = new SculptTool(mesh, this.camera, renderer);
-    this.tool.events.on('edited', () => {
+    this.tool = new SculptTool(document.mesh, this.camera, renderer, (stroke) =>
+      document.commitStroke(stroke),
+    );
+    document.attach({
+      setMesh: (mesh) => {
+        this.tool.setMesh(mesh);
+        renderer.setMesh(mesh);
+        this.afterCameraMove();
+      },
+      meshEdited: (vertices) => {
+        this.tool.meshEdited(vertices);
+        this.needsRender = true;
+      },
+    });
+    document.events.on('edited', () => {
       this.dirtyDocument = true;
       this.needsRender = true;
     });
     this.tool.events.on('settings', () => (this.needsRender = true));
-    renderer.setMesh(mesh);
+    renderer.setMesh(document.mesh);
     this.frame();
     this.bindInput();
     this.observeSize();
@@ -77,13 +89,24 @@ export class AppController {
   // --- commands (called by hotkeys and UI) ---------------------------------
 
   run(cmd: HotkeyId): void {
+    // Nothing that swaps or rewrites the mesh may happen mid-stroke.
+    if (this.tool.isStroking && cmd !== 'radiusDown' && cmd !== 'radiusUp') return;
     switch (cmd) {
       case 'undo':
-        this.tool.undo();
+        this.document.undo();
         break;
       case 'redo':
       case 'redoAlt':
-        this.tool.redo();
+        this.document.redo();
+        break;
+      case 'levelUp':
+        this.document.stepLevel(1);
+        break;
+      case 'levelDown':
+        this.document.stepLevel(-1);
+        break;
+      case 'addLevel':
+        this.document.addLevel();
         break;
       case 'radiusDown':
         this.tool.stepRadius(-1);
@@ -101,7 +124,8 @@ export class AppController {
   }
 
   frame(): void {
-    const b = computeBounds(this.mesh.positions, this.mesh.vertexCount);
+    const mesh = this.document.mesh;
+    const b = computeBounds(mesh.positions, mesh.vertexCount);
     this.camera.frame(b.center as Vec3, b.radius);
     this.afterCameraMove();
   }
@@ -141,8 +165,6 @@ export class AppController {
       this.events.emit('stats', {
         fps: Math.round((this.statFrames * 1000) / elapsed),
         frameMs: this.statWorstMs,
-        triangles: this.mesh.triangleCount,
-        vertices: this.mesh.vertexCount,
       });
       this.statFrames = 0;
       this.statWorstMs = 0;

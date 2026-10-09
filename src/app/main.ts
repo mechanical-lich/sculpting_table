@@ -1,14 +1,17 @@
 import { mount } from 'svelte';
-import { createMesh } from '../core/mesh';
+import { Multires } from '../core/multires';
 import { createQuadSphere } from '../core/quadSphere';
+import { quadTopology } from '../core/subdivision';
 import { createWebGPURenderer } from '../gpu/webgpuRenderer';
 import App from '../ui/App.svelte';
 import { loadKeyboardLayout } from '../ui/hotkeys';
 import { AppController } from './controller';
+import { SculptDocument } from './document';
 import './style.css';
 
-/** 12 * 204^2 = 499,392 triangles. */
-const STARTER_SEGMENTS = 204;
+/** Starter: a 16-segment quad sphere (1,536 quads) at level 4 = 786,432 triangles. */
+const STARTER_SEGMENTS = 16;
+const STARTER_LEVELS = 4;
 
 async function start(): Promise<void> {
   const root = document.getElementById('app')!;
@@ -28,8 +31,12 @@ async function start(): Promise<void> {
   });
 
   const sphere = createQuadSphere(STARTER_SEGMENTS);
-  const mesh = createMesh(sphere.positions, sphere.indices, sphere.quads);
-  const controller = new AppController(canvas, renderer, mesh);
+  const multires = new Multires(
+    quadTopology(sphere.quads, sphere.positions.length / 3),
+    sphere.positions,
+  );
+  for (let i = 0; i < STARTER_LEVELS; i++) multires.addLevel();
+  const controller = new AppController(canvas, renderer, new SculptDocument(multires));
 
   void loadKeyboardLayout();
   mount(App, { target: root, props: { controller } });

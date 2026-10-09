@@ -3,7 +3,7 @@ import type { Mesh } from '../core/mesh';
 import { NormalUpdater } from '../core/normals';
 import { RaycastScratch, raycastMesh, type RayHit } from '../core/raycast';
 import { SpatialGrid } from '../core/spatialGrid';
-import { StrokeRecorder, UndoStack } from '../core/undo';
+import { StrokeRecorder, type ArrayPatch } from '../core/undo';
 import type { BrushOverlay } from '../gpu/renderer';
 import type { Camera } from './camera';
 import { Emitter } from './emitter';
@@ -20,9 +20,6 @@ export interface ToolSettings {
 
 export interface ToolEvents extends Record<string, unknown> {
   settings: ToolSettings;
-  history: { canUndo: boolean; canRedo: boolean };
-  /** The mesh changed (stroke, undo, redo). */
-  edited: undefined;
 }
 
 export interface StrokeModifiers {
@@ -46,9 +43,13 @@ export interface MeshSink {
   markDirty(vertices: Uint32Array): void;
 }
 
+/** Receives each finished stroke (a patch on the mesh positions), e.g. for multires and undo. */
+export type StrokeCommit = (stroke: ArrayPatch) => void;
+
 /**
- * Sculpt tool state machine: hover, stroke (begin -> samples -> end), and
- * undo/redo. Pointer input is queued; `update()` does the work once per frame.
+ * Sculpt tool state machine: hover and stroke (begin -> samples -> end) on
+ * the current mesh. Pointer input is queued; `update()` does the work once
+ * per frame. Finished strokes go to `onStroke`; the tool keeps no history.
  */
 export class SculptTool {
   readonly events = new Emitter<ToolEvents>();
@@ -61,10 +62,9 @@ export class SculptTool {
 
   private readonly grid = new SpatialGrid();
   private readonly raycastScratch = new RaycastScratch();
-  private readonly engine: BrushEngine;
-  private readonly normals: NormalUpdater;
-  private readonly recorder: StrokeRecorder;
-  private readonly undoStack = new UndoStack();
+  private engine!: BrushEngine;
+  private normals!: NormalUpdater;
+  private recorder!: StrokeRecorder;
   private readonly sampler = new StrokeSampler();
 
   private stroking = false;
@@ -84,18 +84,34 @@ export class SculptTool {
   private modifiers: StrokeModifiers = { invert: false, smooth: false };
 
   constructor(
-    private readonly mesh: Mesh,
+    private mesh: Mesh,
     private readonly camera: Camera,
     private readonly sink: MeshSink,
+    private readonly onStroke: StrokeCommit,
   ) {
-    this.engine = new BrushEngine(mesh.vertexCount);
-    this.normals = new NormalUpdater(mesh);
-    this.recorder = new StrokeRecorder(mesh.vertexCount);
-    this.grid.buildFromMesh(mesh);
+    this.setMesh(mesh);
   }
 
   get isStroking(): boolean {
     return this.stroking;
+  }
+
+  /** Switches to another mesh (e.g. a different subdivision level). */
+  setMesh(mesh: Mesh): void {
+    this.mesh = mesh;
+    this.engine = new BrushEngine(mesh.vertexCount);
+    this.normals = new NormalUpdater(mesh);
+    this.recorder = new StrokeRecorder(mesh.vertexCount);
+    this.grid.buildFromMesh(mesh);
+    this.lastHit = null;
+    this.hoverPending = true;
+  }
+
+  /** Refreshes normals, the spatial grid and GPU data after outside edits (undo, redo). */
+  meshEdited(vertices: Uint32Array): void {
+    this.sink.markDirty(this.normals.update(this.mesh, vertices));
+    this.grid.updateFromMesh(this.mesh, vertices);
+    this.hoverPending = true;
   }
 
   // --- settings -----------------------------------------------------------
@@ -176,42 +192,9 @@ export class SculptTool {
     this.stroking = false;
     this.sampler.dabs.length = 0;
 
-    const entry = this.recorder.end(this.mesh);
-    if (entry) {
-      this.undoStack.push(entry);
-      this.emitHistory();
-      this.events.emit('edited', undefined);
-    }
+    const stroke = this.recorder.end(this.mesh);
+    if (stroke) this.onStroke(stroke);
     this.hover(s.x, s.y);
-  }
-
-  // --- history ------------------------------------------------------------
-
-  undo(): boolean {
-    if (this.stroking) return false;
-    return this.applyHistory(this.undoStack.undo(this.mesh));
-  }
-
-  redo(): boolean {
-    if (this.stroking) return false;
-    return this.applyHistory(this.undoStack.redo(this.mesh));
-  }
-
-  private applyHistory(indices: Uint32Array | null): boolean {
-    if (!indices) return false;
-    this.sink.markDirty(this.normals.update(this.mesh, indices));
-    this.grid.updateFromMesh(this.mesh, indices);
-    this.hoverPending = true;
-    this.emitHistory();
-    this.events.emit('edited', undefined);
-    return true;
-  }
-
-  private emitHistory(): void {
-    this.events.emit('history', {
-      canUndo: this.undoStack.canUndo,
-      canRedo: this.undoStack.canRedo,
-    });
   }
 
   // --- per frame ----------------------------------------------------------

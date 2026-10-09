@@ -37,6 +37,11 @@ export class FloatList {
     this.data = new Float32Array(capacity);
   }
 
+  push(x: number): void {
+    if (this.length === this.data.length) this.grow(this.length + 1);
+    this.data[this.length++] = x;
+  }
+
   push3(x: number, y: number, z: number): void {
     if (this.length + 3 > this.data.length) this.grow(this.length + 3);
     const d = this.data;
