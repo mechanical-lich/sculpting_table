@@ -109,7 +109,8 @@ export function applyEntry(entry: UndoEntry, side: 'before' | 'after'): void {
   }
 }
 
-function entryBytes(e: UndoEntry): number {
+/** Bytes held by a patch-based entry. */
+export function entryBytes(e: UndoEntry): number {
   let bytes = 0;
   for (const p of e.patches)
     bytes += p.indices.byteLength + p.before.byteLength + p.after.byteLength;
@@ -120,13 +121,17 @@ function entryBytes(e: UndoEntry): number {
  * Undo history with a memory budget; the oldest entries are dropped when it
  * is exceeded. `undo`/`redo` only move entries between stacks: the caller
  * applies them (see `applyEntry`) and refreshes whatever depends on them.
+ * Generic so the app can mix kinds of entries (strokes, tree edits, ...).
  */
-export class UndoStack {
-  private readonly done: UndoEntry[] = [];
-  private readonly undone: UndoEntry[] = [];
+export class UndoStack<E = UndoEntry> {
+  private readonly done: E[] = [];
+  private readonly undone: E[] = [];
   private bytes = 0;
 
-  constructor(private readonly budgetBytes = 512 * 1024 * 1024) {}
+  constructor(
+    private readonly sizeOf: (e: E) => number = entryBytes as unknown as (e: E) => number,
+    private readonly budgetBytes = 512 * 1024 * 1024,
+  ) {}
 
   get canUndo(): boolean {
     return this.done.length > 0;
@@ -137,31 +142,31 @@ export class UndoStack {
   }
 
   /** The entry `undo` would return, without popping it. */
-  peekUndo(): UndoEntry | null {
+  peekUndo(): E | null {
     return this.done[this.done.length - 1] ?? null;
   }
 
-  peekRedo(): UndoEntry | null {
+  peekRedo(): E | null {
     return this.undone[this.undone.length - 1] ?? null;
   }
 
-  push(entry: UndoEntry): void {
+  push(entry: E): void {
     this.done.push(entry);
-    this.bytes += entryBytes(entry);
-    for (const e of this.undone) this.bytes -= entryBytes(e);
+    this.bytes += this.sizeOf(entry);
+    for (const e of this.undone) this.bytes -= this.sizeOf(e);
     this.undone.length = 0;
     while (this.bytes > this.budgetBytes && this.done.length > 1) {
-      this.bytes -= entryBytes(this.done.shift()!);
+      this.bytes -= this.sizeOf(this.done.shift()!);
     }
   }
 
-  undo(): UndoEntry | null {
+  undo(): E | null {
     const e = this.done.pop();
     if (e) this.undone.push(e);
     return e ?? null;
   }
 
-  redo(): UndoEntry | null {
+  redo(): E | null {
     const e = this.undone.pop();
     if (e) this.done.push(e);
     return e ?? null;

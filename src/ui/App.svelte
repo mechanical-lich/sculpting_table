@@ -1,6 +1,13 @@
 <script lang="ts">
-  import type { AppController, Stats } from '../app/controller';
-  import type { LevelInfo } from '../app/document';
+  import type { AppController, Stats, ArmatureStatus } from '../app/controller';
+  import type { DocumentMode, LevelInfo } from '../app/document';
+  import {
+    ARMATURE_TOOL_ORDER,
+    ARMATURE_TOOLS,
+    type ArmatureSettings,
+    type ArmatureToolKind,
+  } from '../tools/armatureTool';
+  import ArmaturePanel from './ArmaturePanel.svelte';
   import { BRUSH_ORDER, BRUSHES, type BrushKind } from '../core/brush';
   import type { ToolSettings } from '../tools/sculptTool';
   import { RADIUS_MAX_PX, RADIUS_MIN_PX } from '../tools/sculptTool';
@@ -22,6 +29,10 @@
   let level = $state<LevelInfo | null>(null);
   let stampEntries = $state<readonly StampEntry[]>([]);
   let activeBrush = $derived<BrushKind>(settings?.brush ?? 'sculpt');
+  let mode = $state<DocumentMode>('sculpt');
+  let armatureSettings = $state<ArmatureSettings | null>(null);
+  let armatureState = $state<ArmatureStatus | null>(null);
+  let nodeCount = $state(1);
 
   $effect(() => {
     settings = {
@@ -35,7 +46,16 @@
     };
     level = controller.document.levelInfo();
     stampEntries = [...tool.stamps.entries];
+    mode = controller.document.mode;
+    armatureSettings = { ...controller.armature.settings };
+    armatureState = controller.armatureStatus;
+    nodeCount = controller.document.tree.count;
     const unsubs = [
+      controller.document.events.on('mode', (m) => (mode = m)),
+      controller.document.events.on('edited', () => (nodeCount = controller.document.tree.count)),
+      controller.armature.events.on('edited', () => (nodeCount = controller.document.tree.count)),
+      controller.armature.events.on('settings', (z) => (armatureSettings = z)),
+      controller.events.on('armatureState', (z) => (armatureState = z)),
       tool.events.on('stamps', (e) => (stampEntries = [...e])),
       tool.events.on('settings', (s) => (settings = s)),
       controller.document.events.on('history', (h) => (history = h)),
@@ -50,6 +70,16 @@
   const shift = IS_MAC ? '⇧' : 'Shift';
   const altShift = IS_MAC ? '⌥⇧' : 'Alt+Shift';
   const altCtrl = IS_MAC ? '⌥⌃' : 'Alt+Ctrl';
+
+  // Each icon sketches what the tool does to a sphere.
+  const armatureToolIcons: Record<ArmatureToolKind, string> = {
+    draw: 'M9 15 a5 5 0 1 0 0.01 0 M13 9 L18 4 M15 4 H18 V7',
+    move: 'M12 3 V21 M3 12 H21 M12 3 l-2.5 2.5 M12 3 l2.5 2.5 M21 12 l-2.5 -2.5 M21 12 l-2.5 2.5',
+    scale:
+      'M12 12 m-3 0 a3 3 0 1 0 6 0 a3 3 0 1 0 -6 0 M4 20 L8.5 15.5 M20 4 L15.5 8.5 M4 20 h4 M4 20 v-4 M20 4 h-4 M20 4 v4',
+    rotate: 'M19 12 A7 7 0 1 1 12 5 M12 5 l3 -2 M12 5 l3 2',
+    delete: 'M12 12 m-6 0 a6 6 0 1 0 12 0 a6 6 0 1 0 -12 0 M8.5 8.5 L15.5 15.5 M15.5 8.5 L8.5 15.5',
+  };
 
   function formatCount(n: number): string {
     return n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : `${Math.round(n / 1000)}k`;
@@ -77,7 +107,16 @@
       >Frame</button
     >
   </div>
-  {#if level}
+  {#if mode === 'armature'}
+    <button class="primary" disabled={armatureState?.making} onclick={() => controller.makeMesh()}
+      >{armatureState?.making ? 'Making mesh…' : 'Make mesh'}</button
+    >
+  {:else}
+    <button onclick={() => controller.backToArmature()} title="Back to the armature (undoable)"
+      >Armature</button
+    >
+  {/if}
+  {#if level && mode === 'sculpt'}
     <div class="group level" aria-label="Subdivision level">
       <button
         disabled={level.level === 0}
@@ -101,12 +140,51 @@
     </div>
   {/if}
   <span class="stats">
-    {#if level}{formatCount(level.triangles)} tris{/if}
+    {#if mode === 'armature'}{nodeCount}
+      {nodeCount === 1 ? 'sphere' : 'spheres'}{:else if level}{formatCount(level.triangles)} tris{/if}
     {#if stats}· {stats.fps} fps · {stats.frameMs.toFixed(1)} ms{/if}
   </span>
 </div>
 
-{#if settings}
+{#if mode === 'armature' && armatureSettings && armatureState && settings}
+  <aside class="panel">
+    <ArmaturePanel
+      settings={armatureSettings}
+      status={armatureState}
+      symmetryX={settings.symmetryX}
+      {nodeCount}
+      previewKey={hotkeyLabel('preview')}
+      deleteKey={IS_MAC ? hotkeyLabel('deleteNodeAlt') : hotkeyLabel('deleteNode')}
+      onsymmetry={(on) => tool.setSymmetryX(on)}
+      onpreview={(on) => controller.armature.setPreview(on)}
+      onblend={(v) => controller.armature.setBlend(v)}
+      onresolution={(v) => controller.armature.setResolution(v)}
+      onmake={() => controller.makeMesh()}
+    />
+  </aside>
+  <nav class="tray" aria-label="Armature tools">
+    {#each ARMATURE_TOOL_ORDER as z (z)}
+      <button
+        class:active={armatureSettings.tool === z}
+        onclick={() => controller.armature.setTool(z)}
+        title={ARMATURE_TOOLS[z].hint}
+        aria-pressed={armatureSettings.tool === z}
+      >
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+          <path
+            d={armatureToolIcons[z]}
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.7"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+        {ARMATURE_TOOLS[z].label}
+      </button>
+    {/each}
+  </nav>
+{:else if settings}
   <aside class="panel">
     <h2>{BRUSHES[activeBrush].label} Properties</h2>
     <p class="hint">{BRUSHES[activeBrush].hint}</p>
@@ -407,6 +485,15 @@
   }
   button:hover:not(:disabled) {
     background: var(--button-hover);
+  }
+  button.primary {
+    font-weight: 600;
+    color: #1e1f22;
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  button.primary:hover:not(:disabled) {
+    background: #ecc865;
   }
   button:disabled {
     opacity: 0.4;

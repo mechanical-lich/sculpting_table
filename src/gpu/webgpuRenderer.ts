@@ -5,6 +5,7 @@ import { DirtyChunks } from './dirtyChunks';
 import meshWgsl from './mesh.wgsl?raw';
 import type { FrameParams, Renderer } from './renderer';
 import stencilWgsl from './stencil.wgsl?raw';
+import { ArmatureLayer } from './armatureLayer';
 
 const SAMPLE_COUNT = 4;
 const DEPTH_FORMAT: GPUTextureFormat = 'depth24plus';
@@ -56,6 +57,7 @@ export class WebGPURenderer implements Renderer {
   private msaaTexture: GPUTexture | null = null;
   private depthTexture: GPUTexture | null = null;
   private gpuMesh: GpuMesh | null = null;
+  private readonly armature: ArmatureLayer;
 
   constructor(
     readonly device: GPUDevice,
@@ -136,6 +138,13 @@ export class WebGPURenderer implements Renderer {
       size: UNIFORM_FLOATS * 4,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+    this.armature = new ArmatureLayer(
+      device,
+      this.format,
+      DEPTH_FORMAT,
+      SAMPLE_COUNT,
+      this.uniformBuffer,
+    );
     this.bindGroup = device.createBindGroup({
       layout: this.meshPipeline.getBindGroupLayout(0),
       entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
@@ -248,7 +257,7 @@ export class WebGPURenderer implements Renderer {
     pass.setPipeline(this.bgPipeline);
     pass.draw(3);
 
-    if (gm) {
+    if (gm && frame.showMesh) {
       pass.setPipeline(this.meshPipeline);
       pass.setBindGroup(0, this.bindGroup);
       pass.setVertexBuffer(0, gm.positions);
@@ -257,6 +266,8 @@ export class WebGPURenderer implements Renderer {
       pass.setIndexBuffer(gm.indices, 'uint32');
       pass.drawIndexed(gm.indexCount);
     }
+
+    if (frame.armature) this.armature.draw(pass, frame.armature);
 
     const st = frame.stencil;
     if (st && this.stencilBindGroup) {
@@ -282,6 +293,7 @@ export class WebGPURenderer implements Renderer {
     this.depthTexture?.destroy();
     this.uniformBuffer.destroy();
     this.stencilUniforms.destroy();
+    this.armature.destroy();
     this.stencilTexture?.destroy();
     this.device.destroy();
   }

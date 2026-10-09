@@ -68,6 +68,19 @@ export class Camera {
     return { origin: eye, dir: [d[0] / len, d[1] / len, d[2] / len] };
   }
 
+  /** CSS-pixel screen position of a world point (in front of the camera). */
+  worldToScreen(p: Vec3): [number, number] {
+    const { eye, right, up, forward } = this.basis();
+    const dx = p[0] - eye[0],
+      dy = p[1] - eye[1],
+      dz = p[2] - eye[2];
+    const depth = dx * forward[0] + dy * forward[1] + dz * forward[2];
+    const tanHalf = Math.tan(this.fovY / 2);
+    const sx = (dx * right[0] + dy * right[1] + dz * right[2]) / (depth * tanHalf * this.aspect);
+    const sy = (dx * up[0] + dy * up[1] + dz * up[2]) / (depth * tanHalf);
+    return [((sx + 1) / 2) * this.widthPx, ((1 - sy) / 2) * this.heightPx];
+  }
+
   /** World units per CSS pixel at a given view depth. */
   worldPerPixel(depth: number): number {
     return (2 * depth * Math.tan(this.fovY / 2)) / this.heightPx;

@@ -1,4 +1,6 @@
-import { computeBounds } from '../core/mesh';
+import { computeBounds, createMesh, type Mesh } from '../core/mesh';
+import { quadTopology, triangulate } from '../core/subdivision';
+import { validateTree } from '../core/armature/tree';
 import type { Vec3 } from '../core/math';
 import type { Renderer } from '../gpu/renderer';
 import { Camera } from '../tools/camera';
@@ -11,6 +13,7 @@ import {
   type NavPreset,
 } from '../tools/navigation';
 import { SculptTool } from '../tools/sculptTool';
+import { ArmatureTool } from '../tools/armatureTool';
 import type { StrokeSample } from '../tools/stroke';
 import {
   IS_MAC,
@@ -21,6 +24,10 @@ import {
   type HotkeyId,
 } from '../ui/hotkeys';
 import type { MaskCommand, SculptDocument } from './document';
+import { Kernel } from './kernel';
+
+/** Grid cells for the live skin preview (Make mesh uses the panel's resolution). */
+const PREVIEW_CELLS = 64;
 
 /** An SVG cursor drawn white with a dark outline, so it reads on any background. */
 function svgCursor(path: string, fallback: string): string {
@@ -47,8 +54,20 @@ export interface Stats {
   frameMs: number;
 }
 
+/** Armature skinning status, for the panel. */
+export interface ArmatureStatus {
+  /** Time of the last preview skin, or null before the first. */
+  previewMs: number | null;
+  /** Spheres too thin for the grid to skin well. */
+  thinNodes: number;
+  error: string | null;
+  /** Make mesh is running. */
+  making: boolean;
+}
+
 export interface ControllerEvents extends Record<string, unknown> {
   stats: Stats;
+  armatureState: ArmatureStatus;
 }
 
 /**
@@ -58,6 +77,7 @@ export interface ControllerEvents extends Record<string, unknown> {
 export class AppController {
   readonly camera = new Camera();
   readonly tool: SculptTool;
+  readonly armature: ArmatureTool;
   readonly events = new Emitter<ControllerEvents>();
   nav: NavPreset = MUDBOX_NAV;
 
@@ -82,6 +102,17 @@ export class AppController {
   private statWorstMs = 0;
   private statStart = performance.now();
   private readonly cleanup: (() => void)[] = [];
+  private readonly kernel = new Kernel();
+  private armatureDragging = false;
+  /** The viewport has had its real size at least once (framing needs the aspect). */
+  private sized = false;
+  private previewMesh: Mesh | null = null;
+  private armatureState: ArmatureStatus = {
+    previewMs: null,
+    thinNodes: 0,
+    error: null,
+    making: false,
+  };
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -92,6 +123,21 @@ export class AppController {
     this.tool = new SculptTool(document.mesh, this.camera, renderer, (stroke, kind) =>
       document.commitStroke(stroke, kind),
     );
+    this.armature = new ArmatureTool(document, this.camera, () => this.tool.settings.symmetryX);
+    this.armature.events.on('edited', () => {
+      this.needsRender = true;
+      this.requestPreview();
+    });
+    this.armature.events.on('settings', () => {
+      this.needsRender = true;
+      this.requestPreview();
+    });
+    document.events.on('tree', () => {
+      this.armature.treeReplaced();
+      this.needsRender = true;
+      this.requestPreview();
+    });
+    document.events.on('mode', (mode) => this.modeChanged(mode));
     document.attach({
       setMesh: (mesh) => {
         this.tool.setMesh(mesh);
@@ -120,7 +166,7 @@ export class AppController {
       }
     });
     renderer.setMesh(document.mesh);
-    this.frame();
+    this.modeChanged(document.mode);
     this.bindInput();
     this.observeSize();
     this.rafId = requestAnimationFrame(this.tick);
@@ -128,15 +174,38 @@ export class AppController {
 
   destroy(): void {
     cancelAnimationFrame(this.rafId);
+    this.kernel.destroy();
     for (const fn of this.cleanup) fn();
     this.renderer.destroy();
   }
 
   // --- commands (called by hotkeys and UI) ---------------------------------
 
+  get mode() {
+    return this.document.mode;
+  }
+
   run(cmd: HotkeyId): void {
-    // Nothing that swaps or rewrites the mesh may happen mid-stroke.
+    // Nothing that swaps or rewrites the mesh may happen mid-stroke or mid-drag.
     if (this.tool.isStroking && cmd !== 'radiusDown' && cmd !== 'radiusUp') return;
+    if (this.armatureDragging) return;
+    const sculpting = this.document.mode === 'sculpt';
+    switch (cmd) {
+      case 'preview':
+        if (!sculpting) this.armature.setPreview(!this.armature.settings.preview);
+        return;
+      case 'deleteNode':
+      case 'deleteNodeAlt':
+        if (!sculpting) this.armature.deleteHovered();
+        return;
+      case 'levelUp':
+      case 'levelDown':
+      case 'addLevel':
+      case 'radiusDown':
+      case 'radiusUp':
+        if (!sculpting) return;
+        break;
+    }
     switch (cmd) {
       case 'undo':
         this.document.undo();
@@ -175,10 +244,111 @@ export class AppController {
   }
 
   frame(): void {
-    const mesh = this.document.mesh;
-    const b = computeBounds(mesh.positions, mesh.vertexCount);
-    this.camera.frame(b.center as Vec3, b.radius);
+    if (this.document.mode === 'armature') {
+      // Bounds of the spheres themselves.
+      const t = this.document.tree;
+      const pts = new Float32Array(t.count * 6 * 3);
+      for (let i = 0; i < t.count; i++) {
+        const [x, y, z, r] = t.spheres.subarray(i * 4, i * 4 + 4);
+        pts.set(
+          [x - r, y, z, x + r, y, z, x, y - r, z, x, y + r, z, x, y, z - r, x, y, z + r],
+          i * 18,
+        );
+      }
+      const b = computeBounds(pts);
+      this.camera.frame(b.center as Vec3, b.radius * 1.15);
+    } else {
+      const mesh = this.document.mesh;
+      const b = computeBounds(mesh.positions, mesh.vertexCount);
+      this.camera.frame(b.center as Vec3, b.radius);
+    }
     this.afterCameraMove();
+  }
+
+  // --- Armature --------------------------------------------------------------
+
+  /** Skins the tree at full resolution and switches to sculpting it. */
+  makeMesh(): void {
+    if (this.armatureState.making || this.document.mode !== 'armature') return;
+    const z = this.armature.settings;
+    this.setStatus({ making: true, error: null });
+    void this.kernel
+      .skin(
+        this.document.tree,
+        { maxCells: z.resolution, blend: z.blend, symmetric: this.symmetricTree() },
+        'final',
+      )
+      .then((outcome) => {
+        this.setStatus({ making: false });
+        if (!outcome) return;
+        if (!outcome.ok) {
+          this.setStatus({ error: outcome.error });
+          return;
+        }
+        this.document.makeMesh(outcome.result.positions, outcome.result.quads);
+      });
+  }
+
+  /** Back to the tree (undoable; the sculpt stays in the history). */
+  backToArmature(): void {
+    if (!this.tool.isStroking) this.document.backToArmature();
+  }
+
+  /** Skins at preview resolution when the preview is on. Only the newest request runs. */
+  private requestPreview(): void {
+    if (this.document.mode !== 'armature' || !this.armature.settings.preview) return;
+    const z = this.armature.settings;
+    void this.kernel
+      .skin(
+        this.document.tree,
+        { maxCells: PREVIEW_CELLS, blend: z.blend, symmetric: this.symmetricTree() },
+        'preview',
+      )
+      .then((outcome) => {
+        if (!outcome || this.document.mode !== 'armature') return;
+        if (!outcome.ok) {
+          this.setStatus({ error: outcome.error });
+          return;
+        }
+        const { positions, quads, thinNodes } = outcome.result;
+        const topo = quadTopology(quads, positions.length / 3);
+        this.previewMesh = createMesh(positions, triangulate(topo, positions), quads);
+        this.renderer.setMesh(this.previewMesh);
+        this.setStatus({ previewMs: outcome.ms, thinNodes: thinNodes.length, error: null });
+        this.needsRender = true;
+      });
+  }
+
+  /** Symmetric skinning needs a tree whose mirror pairs really are mirror images. */
+  private symmetricTree(): boolean {
+    if (!this.tool.settings.symmetryX) return false;
+    try {
+      validateTree(this.document.tree, true);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private modeChanged(mode: 'armature' | 'sculpt'): void {
+    if (mode === 'sculpt') {
+      this.tool.setMesh(this.document.mesh);
+      this.renderer.setMesh(this.document.mesh);
+    } else {
+      this.previewMesh = null;
+      this.requestPreview();
+    }
+    this.frame();
+    this.updateCursor();
+  }
+
+  private setStatus(s: Partial<ArmatureStatus>): void {
+    this.armatureState = { ...this.armatureState, ...s };
+    this.events.emit('armatureState', this.armatureState);
+  }
+
+  get armatureStatus(): ArmatureStatus {
+    return this.armatureState;
   }
 
   // --- frame loop ----------------------------------------------------------
@@ -186,7 +356,8 @@ export class AppController {
   private readonly tick = (): void => {
     this.rafId = requestAnimationFrame(this.tick);
     const t0 = performance.now();
-    if (this.tool.update()) this.needsRender = true;
+    const sculpting = this.document.mode === 'sculpt';
+    if (sculpting && this.tool.update()) this.needsRender = true;
     if (this.needsRender) {
       this.needsRender = false;
       const { eye, right, up, forward } = this.camera.basis();
@@ -208,11 +379,19 @@ export class AppController {
         fillLight: fill,
         // No brush ring while the mouse drives the camera or the stencil.
         brush:
-          this.navAction || this.stencilAction || (this.altHeld && !this.tool.isStroking)
+          !sculpting ||
+          this.navAction ||
+          this.stencilAction ||
+          (this.altHeld && !this.tool.isStroking)
             ? null
             : this.tool.overlay(),
-        stencil: this.stencilOverlay(),
+        stencil: sculpting ? this.stencilOverlay() : null,
         symmetryX: this.tool.settings.symmetryX,
+        // In Armature mode the renderer's mesh is the skin preview, if any.
+        showMesh: sculpting || (this.armature.settings.preview && this.previewMesh !== null),
+        armature: sculpting
+          ? null
+          : this.armature.overlay(this.armature.settings.preview && this.previewMesh !== null),
       });
       this.statFrames++;
     }
@@ -231,7 +410,8 @@ export class AppController {
 
   private afterCameraMove(): void {
     this.needsRender = true;
-    this.tool.hover(this.lastX, this.lastY);
+    if (this.document.mode === 'sculpt') this.tool.hover(this.lastX, this.lastY);
+    else this.armature.hover(this.lastX, this.lastY);
   }
 
   // --- input ---------------------------------------------------------------
@@ -257,6 +437,7 @@ export class AppController {
     this.listen(c, 'pointerleave', () => {
       if (this.activePointer === null) {
         this.tool.clearHover();
+        this.armature.clearHover();
         this.needsRender = true;
       }
     });
@@ -304,11 +485,17 @@ export class AppController {
     const nav = this.nav.match({ ...modifiersOf(e), button });
     [this.lastX, this.lastY] = this.localPoint(e);
 
-    if (this.stencilKey && this.tool.settings.stencil.id !== null) {
+    const sculpting = this.document.mode === 'sculpt';
+    if (sculpting && this.stencilKey && this.tool.settings.stencil.id !== null) {
       this.stencilAction = button === 0 ? 'rotate' : button === 1 ? 'move' : 'scale';
     } else if (nav) {
       this.navAction = nav;
       this.updateCursor();
+    } else if (!sculpting) {
+      if (button !== 0) return;
+      const [x, y] = this.localPoint(e);
+      this.armatureDragging = this.armature.begin(x, y, e.shiftKey);
+      if (!this.armatureDragging) return;
     } else if (button === 0) {
       this.tool.beginStroke(this.sample(e), { invert: e.ctrlKey, smooth: e.shiftKey });
     } else {
@@ -345,6 +532,15 @@ export class AppController {
     this.lastX = x;
     this.lastY = y;
 
+    if (this.document.mode === 'armature') {
+      if (this.armatureDragging) this.armature.move(x, y);
+      else {
+        this.syncModifiers(e);
+        this.armature.hover(x, y);
+      }
+      this.needsRender = true;
+      return;
+    }
     if (this.tool.isStroking) {
       // Pens report at a higher rate than pointermove fires; use every sample.
       const events = e.getCoalescedEvents?.() ?? [];
@@ -367,6 +563,9 @@ export class AppController {
       this.navAction = null;
       this.updateCursor();
       this.afterCameraMove();
+    } else if (this.armatureDragging) {
+      this.armatureDragging = false;
+      this.armature.end();
     } else {
       this.tool.endStroke(this.sample(e));
     }
@@ -487,6 +686,11 @@ export class AppController {
       );
       this.rect = this.canvas.getBoundingClientRect();
       this.needsRender = true;
+      if (!this.sized) {
+        // The first framing ran before the viewport had its size; redo it with the real aspect.
+        this.sized = true;
+        this.frame();
+      }
     });
     try {
       ro.observe(this.canvas, { box: 'device-pixel-content-box' });

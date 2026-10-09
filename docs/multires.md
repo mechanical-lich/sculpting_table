@@ -58,7 +58,7 @@ date until the user switches to them (see Propagation up).
 
 ### Per-level tables
 
-Level 0 may hold n-gons: ZSphere skinning (Milestone 3) gives a quad-dominant
+Level 0 may hold n-gons: armature skinning (Milestone 3) gives a quad-dominant
 mesh, and imports can contain triangles. After one Catmull-Clark step every
 face is a quad. So:
 

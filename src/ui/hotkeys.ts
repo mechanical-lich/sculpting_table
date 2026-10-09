@@ -29,6 +29,9 @@ export const HOTKEYS = [
   { id: 'levelUp', code: 'PageUp', description: 'Higher subdivision level' },
   { id: 'levelDown', code: 'PageDown', description: 'Lower subdivision level' },
   { id: 'addLevel', code: 'KeyD', shift: true, description: 'Add subdivision level' },
+  { id: 'preview', code: 'KeyA', description: 'Toggle the armature skin preview' },
+  { id: 'deleteNode', code: 'Delete', description: 'Delete the hovered armature sphere' },
+  { id: 'deleteNodeAlt', code: 'Backspace', description: 'Delete the hovered armature sphere' },
 ] as const satisfies readonly Hotkey[];
 
 export type HotkeyId = (typeof HOTKEYS)[number]['id'];
@@ -100,6 +103,8 @@ function codeLabel(code: string): string {
   if (code === 'BracketRight') return ']';
   if (code === 'PageUp') return 'PgUp';
   if (code === 'PageDown') return 'PgDn';
+  if (code === 'Delete') return IS_MAC ? '⌦' : 'Del';
+  if (code === 'Backspace') return IS_MAC ? '⌫' : 'Backspace';
   return code;
 }
 

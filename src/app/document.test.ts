@@ -73,3 +73,45 @@ describe('SculptDocument masks', () => {
     expect(m.levels[2].stale).toBe(false);
   });
 });
+
+describe('SculptDocument Armature', () => {
+  it('records tree edits, makes a mesh, and undoes back through both', async () => {
+    const { skinTree } = await import('../core/armature/skin');
+    const { addChild, cloneTree } = await import('../core/armature/tree');
+    const s = createQuadSphere(4);
+    const placeholder = new Multires(quadTopology(s.quads, s.positions.length / 3), s.positions);
+    const d = new SculptDocument(placeholder, { mode: 'armature' });
+    const modes: string[] = [];
+    d.events.on('mode', (m) => modes.push(m));
+    d.attach({ setMesh: () => {}, meshEdited: () => {}, maskEdited: () => {} });
+
+    const before = cloneTree(d.tree);
+    addChild(d.tree, 0, 0, 0.9, 0, 0.4, true);
+    d.commitTree(before);
+    expect(d.tree.count).toBe(2);
+
+    const r = skinTree(d.tree, { maxCells: 48, blend: 0.5, symmetric: true });
+    d.makeMesh(r.positions, r.quads);
+    expect(d.mode).toBe('sculpt');
+    expect(d.multires).not.toBe(placeholder);
+    expect(d.multires.levels[0].topology.faceCount).toBe(r.quads.length / 4);
+    // Subdivided toward the Make mesh target.
+    expect(d.levelInfo().triangles).toBeGreaterThan(r.quads.length / 2);
+
+    d.undo();
+    expect(d.mode).toBe('armature');
+    expect(d.multires).toBe(placeholder);
+    d.undo();
+    expect(d.tree.count).toBe(1);
+    d.redo();
+    d.redo();
+    expect(d.mode).toBe('sculpt');
+    expect(d.tree.count).toBe(2);
+    expect(modes).toEqual(['sculpt', 'armature', 'sculpt']);
+
+    d.backToArmature();
+    expect(d.mode).toBe('armature');
+    d.undo();
+    expect(d.mode).toBe('sculpt');
+  });
+});

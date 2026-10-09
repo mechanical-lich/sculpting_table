@@ -1,17 +1,22 @@
-import { mount } from 'svelte';
+import { mount, unmount } from 'svelte';
 import { Multires } from '../core/multires';
 import { createQuadSphere } from '../core/quadSphere';
 import { quadTopology } from '../core/subdivision';
 import { createWebGPURenderer } from '../gpu/webgpuRenderer';
 import App from '../ui/App.svelte';
 import { loadKeyboardLayout } from '../ui/hotkeys';
+import StartDialog, { type StartChoice } from '../ui/StartDialog.svelte';
 import { AppController } from './controller';
 import { SculptDocument } from './document';
 import './style.css';
 
-/** Starter: a 16-segment quad sphere (1,536 quads) at level 4 = 786,432 triangles. */
+/**
+ * Both starts use a 16-segment quad sphere (1,536 quads). "Sphere" subdivides
+ * it to level 4 (786,432 triangles) for sculpting right away; "Armature"
+ * keeps it as an unused placeholder model until Make mesh replaces it.
+ */
 const STARTER_SEGMENTS = 16;
-const STARTER_LEVELS = 4;
+const SPHERE_LEVELS = 4;
 
 async function start(): Promise<void> {
   const root = document.getElementById('app')!;
@@ -30,15 +35,34 @@ async function start(): Promise<void> {
     if (info.reason !== 'destroyed') showError(root, `The GPU device was lost: ${info.message}`);
   });
 
+  void loadKeyboardLayout();
+
+  // Ask how to start; the choice isn't an undo step, it's where history begins.
+  const dialog = mount(StartDialog, {
+    target: root,
+    props: {
+      onchoose: (choice: StartChoice) => {
+        void unmount(dialog);
+        begin(root, canvas, renderer, choice);
+      },
+    },
+  });
+}
+
+function begin(
+  root: HTMLElement,
+  canvas: HTMLCanvasElement,
+  renderer: Awaited<ReturnType<typeof createWebGPURenderer>>,
+  choice: StartChoice,
+): void {
   const sphere = createQuadSphere(STARTER_SEGMENTS);
   const multires = new Multires(
     quadTopology(sphere.quads, sphere.positions.length / 3),
     sphere.positions,
   );
-  for (let i = 0; i < STARTER_LEVELS; i++) multires.addLevel();
-  const controller = new AppController(canvas, renderer, new SculptDocument(multires));
-
-  void loadKeyboardLayout();
+  if (choice === 'sphere') for (let i = 0; i < SPHERE_LEVELS; i++) multires.addLevel();
+  const doc = new SculptDocument(multires, { mode: choice === 'sphere' ? 'sculpt' : 'armature' });
+  const controller = new AppController(canvas, renderer, doc);
   mount(App, { target: root, props: { controller } });
 
   if (import.meta.hot) import.meta.hot.dispose(() => controller.destroy());
