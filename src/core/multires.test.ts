@@ -33,7 +33,7 @@ function sculpt(
     engine.applyDab(
       mesh,
       grid,
-      { kind: 'sculpt', x, y, z, radius, strength, symmetryX: false },
+      { kind: 'sculpt', x, y, z, radius, strength, falloff: 'smooth', symmetryX: false },
       rec,
     );
   }

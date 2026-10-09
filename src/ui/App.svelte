@@ -1,9 +1,12 @@
 <script lang="ts">
   import type { AppController, Stats } from '../app/controller';
   import type { LevelInfo } from '../app/document';
-  import type { BrushKind } from '../core/brush';
+  import { BRUSH_ORDER, BRUSHES, type BrushKind } from '../core/brush';
   import type { ToolSettings } from '../tools/sculptTool';
   import { RADIUS_MAX_PX, RADIUS_MIN_PX } from '../tools/sculptTool';
+  import { FALLOFFS } from '../core/falloff';
+  import BrushIcon from './BrushIcon.svelte';
+  import FalloffPicker from './FalloffPicker.svelte';
   import { hotkeyLabel, IS_MAC } from './hotkeys';
 
   let { controller }: { controller: AppController } = $props();
@@ -17,7 +20,11 @@
   let activeBrush = $derived<BrushKind>(settings?.brush ?? 'sculpt');
 
   $effect(() => {
-    settings = { ...tool.settings, strength: { ...tool.settings.strength } };
+    settings = {
+      ...tool.settings,
+      strength: { ...tool.settings.strength },
+      falloff: { ...tool.settings.falloff },
+    };
     level = controller.document.levelInfo();
     const unsubs = [
       tool.events.on('settings', (s) => (settings = s)),
@@ -27,11 +34,6 @@
     ];
     return () => unsubs.forEach((u) => u());
   });
-
-  const brushes: { id: BrushKind; label: string; hint: string }[] = [
-    { id: 'sculpt', label: 'Sculpt', hint: 'Push along the surface normal' },
-    { id: 'smooth', label: 'Smooth', hint: 'Average out surface detail' },
-  ];
 
   const ctrl = IS_MAC ? '⌃' : 'Ctrl';
   const alt = IS_MAC ? '⌥' : 'Alt';
@@ -94,7 +96,8 @@
 
 {#if settings}
   <aside class="panel">
-    <h2>{brushes.find((b) => b.id === activeBrush)?.label} Properties</h2>
+    <h2>{BRUSHES[activeBrush].label} Properties</h2>
+    <p class="hint">{BRUSHES[activeBrush].hint}</p>
 
     <label>
       <span>Size <kbd>{hotkeyLabel('radiusDown')}</kbd><kbd>{hotkeyLabel('radiusUp')}</kbd></span>
@@ -108,17 +111,28 @@
       <output>{settings.radiusPx}px</output>
     </label>
 
-    <label>
-      <span>Strength</span>
-      <input
-        type="range"
-        min="0"
-        max="100"
-        value={Math.round(settings.strength[settings.brush] * 100)}
-        oninput={(e) => tool.setStrength(activeBrush, +e.currentTarget.value / 100)}
+    {#if activeBrush !== 'grab'}
+      <label>
+        <span>Strength</span>
+        <input
+          type="range"
+          min="0"
+          max="100"
+          value={Math.round(settings.strength[activeBrush] * 100)}
+          oninput={(e) => tool.setStrength(activeBrush, +e.currentTarget.value / 100)}
+        />
+        <output>{Math.round(settings.strength[activeBrush] * 100)}</output>
+      </label>
+    {/if}
+
+    <div class="field">
+      <span>Falloff <span class="muted">{FALLOFFS[settings.falloff[activeBrush]].label}</span></span
+      >
+      <FalloffPicker
+        value={settings.falloff[activeBrush]}
+        onchange={(f) => tool.setFalloff(activeBrush, f)}
       />
-      <output>{Math.round(settings.strength[settings.brush] * 100)}</output>
-    </label>
+    </div>
 
     <label class="check">
       <input
@@ -151,14 +165,15 @@
   </aside>
 
   <nav class="tray" aria-label="Sculpt tools">
-    {#each brushes as b (b.id)}
+    {#each BRUSH_ORDER as b (b)}
       <button
-        class:active={settings.brush === b.id}
-        onclick={() => tool.setBrush(b.id)}
-        title={b.hint}
+        class:active={settings.brush === b}
+        onclick={() => tool.setBrush(b)}
+        title={BRUSHES[b].hint}
+        aria-pressed={settings.brush === b}
       >
-        <span class="icon icon-{b.id}"></span>
-        {b.label}
+        <BrushIcon brush={b} />
+        {BRUSHES[b].label}
       </button>
     {/each}
   </nav>
@@ -269,12 +284,31 @@
     margin: 0;
   }
 
+  .field {
+    display: grid;
+    gap: 6px;
+    margin-bottom: 14px;
+  }
+  .muted {
+    color: var(--muted);
+    margin-left: 4px;
+  }
+  .hint {
+    margin: -6px 0 14px;
+    color: var(--muted);
+  }
+
+  /* Centered in the viewport (the area left of the 240px panel). */
   .tray {
     position: absolute;
-    left: 50%;
+    left: calc((100% - 240px) / 2);
     bottom: 12px;
-    transform: translateX(calc(-50% - 120px));
+    transform: translateX(-50%);
+    width: max-content;
+    max-width: calc(100% - 240px - 24px);
     display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
     gap: 4px;
     padding: 4px;
     background: var(--chrome);
@@ -282,28 +316,20 @@
     border-radius: 6px;
   }
   .tray button {
+    flex: none;
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 4px;
-    width: 64px;
-    padding: 6px 4px;
+    gap: 3px;
+    width: 56px;
+    padding: 5px 2px;
+    font-size: 11px;
+    color: var(--muted);
   }
   .tray button.active {
     background: var(--accent-bg);
     border-color: var(--accent);
-  }
-  .icon {
-    width: 22px;
-    height: 22px;
-    border-radius: 50%;
-  }
-  .icon-sculpt {
-    background: radial-gradient(circle at 35% 30%, #ddd, #777 60%, #444);
-  }
-  .icon-smooth {
-    background: radial-gradient(circle at 50% 50%, #aaa, #888 70%, #555);
-    box-shadow: inset 0 0 0 2px #6a6;
+    color: var(--text);
   }
 
   button {

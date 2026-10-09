@@ -105,6 +105,7 @@ describe('raycastMesh after edits', () => {
         z: Math.cos(a) * 0.8,
         radius: 0.3,
         strength: 1,
+        falloff: 'smooth' as const,
         symmetryX: false,
       };
       normals.update(mesh, engine.applyDab(mesh, grid, dab, null));

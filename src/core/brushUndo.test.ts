@@ -27,6 +27,7 @@ const dab = (over: Partial<Dab>): Dab => ({
   z: Math.sqrt(1 - 0.13),
   radius: 0.4,
   strength: 1,
+  falloff: 'smooth',
   symmetryX: false,
   ...over,
 });

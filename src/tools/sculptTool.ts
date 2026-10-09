@@ -1,4 +1,5 @@
-import { BrushEngine, type BrushKind } from '../core/brush';
+import { BRUSH_ORDER, BRUSHES, BrushEngine, type BrushKind } from '../core/brush';
+import type { FalloffKind } from '../core/falloff';
 import type { Mesh } from '../core/mesh';
 import { NormalUpdater } from '../core/normals';
 import { RaycastScratch, raycastMesh, type RayHit } from '../core/raycast';
@@ -15,6 +16,8 @@ export interface ToolSettings {
   radiusPx: number;
   /** Per-brush strength, 0..1. */
   strength: Record<BrushKind, number>;
+  /** Per-brush falloff curve. */
+  falloff: Record<BrushKind, FalloffKind>;
   symmetryX: boolean;
 }
 
@@ -56,7 +59,8 @@ export class SculptTool {
   readonly settings: ToolSettings = {
     brush: 'sculpt',
     radiusPx: 60,
-    strength: { sculpt: 0.5, smooth: 0.5 },
+    strength: perBrush((b) => BRUSHES[b].defaultStrength),
+    falloff: perBrush((b) => BRUSHES[b].defaultFalloff),
     symmetryX: false,
   };
 
@@ -75,6 +79,16 @@ export class SculptTool {
   private dabCursor = 0;
   /** Running average cost of one dab, to avoid starting one that would blow the frame budget. */
   private dabCostMs = 1;
+
+  // Grab strokes: vertices are picked up at the first hit and follow the
+  // pointer in the screen plane at that hit's depth.
+  private grabbing = false;
+  private grabHit: RayHit | null = null;
+  private grabStartX = 0;
+  private grabStartY = 0;
+  private grabX = 0;
+  private grabY = 0;
+  private grabPending = false;
 
   private hoverPending = false;
   private hoverX = 0;
@@ -138,6 +152,11 @@ export class SculptTool {
     this.emitSettings();
   }
 
+  setFalloff(brush: BrushKind, falloff: FalloffKind): void {
+    this.settings.falloff[brush] = falloff;
+    this.emitSettings();
+  }
+
   setSymmetryX(on: boolean): void {
     this.settings.symmetryX = on;
     this.emitSettings();
@@ -152,6 +171,7 @@ export class SculptTool {
     this.events.emit('settings', {
       ...this.settings,
       strength: { ...this.settings.strength },
+      falloff: { ...this.settings.falloff },
     });
   }
 
@@ -176,19 +196,33 @@ export class SculptTool {
     this.strokeSign = mods.invert ? -1 : 1;
     this.strokeRadius = 0;
     this.dabCursor = 0;
-    this.sampler.begin(s);
     this.recorder.begin();
+    if (this.strokeBrush === 'grab') this.beginGrab(s);
+    else this.sampler.begin(s);
   }
 
   addSample(s: StrokeSample): void {
     if (!this.stroking) return;
-    this.sampler.add(s, this.settings.radiusPx * SPACING);
+    if (this.strokeBrush === 'grab') {
+      this.grabX = s.x;
+      this.grabY = s.y;
+      this.grabPending = this.grabbing;
+    } else {
+      this.sampler.add(s, this.settings.radiusPx * SPACING);
+    }
   }
 
   endStroke(s: StrokeSample): void {
     if (!this.stroking) return;
-    this.sampler.end(s, this.settings.radiusPx * SPACING);
-    this.applyPendingDabs(Infinity);
+    if (this.strokeBrush === 'grab') {
+      this.addSample(s);
+      this.applyGrab();
+      this.grabbing = false;
+      this.grabHit = null;
+    } else {
+      this.sampler.end(s, this.settings.radiusPx * SPACING);
+      this.applyPendingDabs(Infinity);
+    }
     this.stroking = false;
     this.sampler.dabs.length = 0;
 
@@ -202,7 +236,9 @@ export class SculptTool {
   /** Applies queued work. Returns true if the view needs redrawing. */
   update(): boolean {
     let changed = false;
-    if (this.stroking) {
+    if (this.stroking && this.strokeBrush === 'grab') {
+      changed = this.applyGrab();
+    } else if (this.stroking) {
       changed = this.applyPendingDabs(FRAME_BUDGET_MS);
     } else if (this.hoverPending) {
       this.hoverPending = false;
@@ -234,6 +270,47 @@ export class SculptTool {
     };
   }
 
+  private beginGrab(s: StrokeSample): void {
+    this.grabStartX = this.grabX = s.x;
+    this.grabStartY = this.grabY = s.y;
+    this.grabPending = false;
+    const hit = this.raycast(s.x, s.y);
+    if (!hit) return;
+    this.strokeRadius = this.radiusAt(hit);
+    this.grabbing = this.engine.beginGrab(
+      this.mesh,
+      this.grid,
+      hit.x,
+      hit.y,
+      hit.z,
+      this.strokeRadius,
+      this.settings.symmetryX,
+      this.settings.falloff.grab,
+      this.recorder,
+    );
+    this.grabHit = hit;
+    this.lastHit = hit;
+    this.lastRadius = this.strokeRadius;
+  }
+
+  /** Moves the grabbed vertices to follow the latest pointer position. */
+  private applyGrab(): boolean {
+    const hit = this.grabHit;
+    if (!this.grabPending || !hit) return false;
+    this.grabPending = false;
+    const { right, up } = this.camera.basis();
+    const wpp = this.camera.worldPerPixel(this.camera.depthOf([hit.x, hit.y, hit.z]));
+    const dx = (this.grabX - this.grabStartX) * wpp,
+      dy = (this.grabY - this.grabStartY) * wpp;
+    const ox = right[0] * dx - up[0] * dy,
+      oy = right[1] * dx - up[1] * dy,
+      oz = right[2] * dx - up[2] * dy;
+    const moved = this.engine.dragGrab(this.mesh, this.grid, ox, oy, oz);
+    this.sink.markDirty(this.normals.update(this.mesh, moved));
+    this.lastHit = { ...hit, x: hit.x + ox, y: hit.y + oy, z: hit.z + oz };
+    return true;
+  }
+
   private applyPendingDabs(budgetMs: number): boolean {
     const dabs = this.sampler.dabs;
     if (this.dabCursor >= dabs.length) return false;
@@ -256,17 +333,19 @@ export class SculptTool {
       this.lastHit = hit;
       this.lastRadius = this.strokeRadius;
 
-      const base = settings.strength[this.strokeBrush] * pressure;
+      const kind = this.strokeBrush === 'grab' ? 'sculpt' : this.strokeBrush;
+      const base = settings.strength[kind] * pressure;
       const touched = this.engine.applyDab(
         this.mesh,
         this.grid,
         {
-          kind: this.strokeBrush,
+          kind,
           x: hit.x,
           y: hit.y,
           z: hit.z,
           radius: this.strokeRadius,
-          strength: this.strokeBrush === 'smooth' ? base * SMOOTH_SCALE : base * this.strokeSign,
+          strength: kind === 'smooth' ? base * SMOOTH_SCALE : base * this.strokeSign,
+          falloff: settings.falloff[kind],
           symmetryX: settings.symmetryX,
         },
         this.recorder,
@@ -306,4 +385,8 @@ export class SculptTool {
     const depth = this.camera.depthOf([hit.x, hit.y, hit.z]);
     return this.settings.radiusPx * this.camera.worldPerPixel(depth);
   }
+}
+
+function perBrush<T>(value: (brush: BrushKind) => T): Record<BrushKind, T> {
+  return Object.fromEntries(BRUSH_ORDER.map((b) => [b, value(b)])) as Record<BrushKind, T>;
 }
